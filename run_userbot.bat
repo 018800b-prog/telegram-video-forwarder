@@ -1,21 +1,9 @@
 @echo off
-title Telegram Userbot Forwarder
-color 0E
+title Telegram Automated Video Forwarder (Userbot)
+color 0B
 echo ========================================================
-echo       Starting Telegram Userbot Forwarder
+echo       Telegram Automated Video Forwarder (Userbot)
 echo ========================================================
 echo.
-
-if not exist .env (
-    echo [!] .env file not found! Copying from .env.example...
-    copy .env.example .env
-    echo [!] Please edit the .env file with your credentials and run again.
-    pause
-    exit /b
-)
-
-py -m pip install -r requirements.txt
-cls
-echo Starting userbot...
-py userbot.py
+py auto_forwarder.py
 pause
