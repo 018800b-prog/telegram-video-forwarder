@@ -153,6 +153,27 @@ async def start_wizard_handler(event):
     )
     await event.reply(welcome_text)
 
+@client.on(events.NewMessage(pattern=r"^/(setgroup|settarget)$"))
+async def in_group_set_handler(event):
+    """Allows setting the target group directly from INSIDE the group!"""
+    # If typed in a group/channel
+    if not event.is_private:
+        chat = await event.get_chat()
+        target_id = event.chat_id
+        title = getattr(chat, 'title', str(target_id))
+        
+        update_runtime_setting("target_chat_id", target_id)
+        
+        reply_text = (
+            f"✅ **এই গ্রুপটি সফলভাবে টার্গেট গ্রুপ হিসেবে সেট হয়েছে!**\n\n"
+            f"🏷️ **নাম:** {title}\n"
+            f"🆔 **ID:** `{target_id}`\n\n"
+            f"🎉 এখন অন্য যেকোনো চ্যানেল বা গ্রুপ থেকে ভিডিও বটের ইনবক্সে (@autforwbdbot) "
+            f"ফরোয়ার্ড করলেই কোনো ট্যাগ ছাড়া সরাসরি এই গ্রুপে আপলোড হয়ে যাবে!"
+        )
+        await event.reply(reply_text)
+        return
+
 @client.on(events.NewMessage(pattern=r"^/id$"))
 async def id_handler(event):
     chat = await event.get_chat()
@@ -165,6 +186,9 @@ async def id_handler(event):
         reply += f"• **চ্যাট নাম:** {chat.title}\n"
     if hasattr(chat, "username") and chat.username:
         reply += f"• **ইউজারনেম:** @{chat.username}\n"
+    
+    if not event.is_private:
+        reply += f"\n💡 এই গ্রুপটিকে টার্গেট বানাতে চাইলে লিখুন: `/setgroup`"
     await event.reply(reply)
 
 @client.on(events.NewMessage(pattern=r"^/status$"))
@@ -256,6 +280,20 @@ async def message_dispatcher(event):
     # ------------------ STEP 1: WAITING TARGET GROUP LINK ------------------
     if current_state == "WAITING_TARGET" and user_text:
         status_msg = await event.reply("🔍 আপনার টার্গেট গ্রুপটি যাচাই করা হচ্ছে...")
+        
+        # Check if user sent a private invite link (t.me/+... or t.me/joinchat/...)
+        if "t.me/+" in user_text or "t.me/joinchat/" in user_text:
+            await status_msg.edit(
+                "💡 **প্রাইভেট গ্রুপের ইনভাইট লিংক সনাক্ত হয়েছে!**\n\n"
+                "টেলিগ্রাম বটের জন্য প্রাইভেট ইনভাইট লিংক সরাসরি চেক করা নিষিদ্ধ (Telegram API restriction)।\n\n"
+                "👉 **তবে আপনার গ্রুপটি সেট করা আরও ১০০ গুণ সহজ:**\n"
+                "১. আপনার ঐ গ্রুপটিতে যান (যেখানে বটটি অ্যাডমিন আছে)।\n"
+                "২. গ্রুপে গিয়ে সরাসরি মেসেজ দিন:\n"
+                "   `/setgroup`\n\n"
+                "✅ ব্যস! বট সাথে সাথে ঐ গ্রুপটিকে আপনার টার্গেট গ্রুপ হিসেবে সেট করে নেবে!"
+            )
+            return
+
         clean = clean_chat_input(user_text)
         
         try:
@@ -284,10 +322,9 @@ async def message_dispatcher(event):
             await status_msg.edit(
                 f"❌ **টার্গেট গ্রুপ কানেক্ট করা সম্ভব হয়নি!**\n\n"
                 f"কারণ: `{e}`\n\n"
-                f"⚠️ **নিশ্চিত করুন:**\n"
-                f"১. বটটিকে (@autforwbdbot) ঐ গ্রুপে মেম্বার হিসেবে অ্যাড করেছেন।\n"
-                f"২. বটটিকে **Admin** অধিকার দিয়েছেন (মিডিয়া পাঠানোর পারমিশন)।\n\n"
-                f"অনুগ্রহ করে অ্যাডমিন বানিয়ে আবার লিংক বা আইডিটি পাঠান।"
+                f"💡 **সহজ সমাধান:**\n"
+                f"আপনার গ্রুপে গিয়ে সরাসরি মেসেজ পাঠান: `/setgroup`\n"
+                f"বট স্বয়ংক্রিয়ভাবে ঐ গ্রুপটিকে টার্গেট হিসেবে চিনে নেবে!"
             )
             return
 
