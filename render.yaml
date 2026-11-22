@@ -3,20 +3,16 @@ services:
     name: telegram-video-forwarder
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python auto_forwarder.py
     plan: free
     envVars:
       - key: API_ID
         sync: false
       - key: API_HASH
         sync: false
-      - key: BOT_TOKEN
-        sync: false
-      - key: OWNER_ID
+      - key: SESSION_STRING
         sync: false
       - key: TARGET_CHAT_ID
-        sync: false
-      - key: SOURCE_CHAT_ID
-        sync: false
+        value: 4402901248
       - key: CAPTION_MODE
         value: original
