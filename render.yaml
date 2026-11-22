@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: telegram-video-forwarder
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: TARGET_CHAT_ID
+        sync: false
+      - key: SOURCE_CHAT_ID
+        sync: false
+      - key: CAPTION_MODE
+        value: original
