@@ -23,7 +23,7 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat, PeerChannel, PeerChat
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
-from telethon.errors import UserAlreadyParticipantError
+from telethon.errors import UserAlreadyParticipantError, FloodWaitError
 
 from config import (
     API_ID,
@@ -129,7 +129,7 @@ async def get_target_entity():
         return None
 
 async def forward_video_core(message, source_name="Source") -> bool:
-    """Core function that uploads video to target cleanly"""
+    """Core function that uploads video to target cleanly with FloodWait auto-recovery"""
     target = await get_target_entity()
     if not target:
         logger.error("Target entity is not ready!")
@@ -139,47 +139,58 @@ async def forward_video_core(message, source_name="Source") -> bool:
     caption_mode = settings.get("caption_mode", "original")
     final_caption = message.text if caption_mode == "original" else None
 
-    try:
-        # Strategy 1: Instant Cloud Forward (0 bandwidth)
-        logger.info(f"📤 Direct Cloud Uploading video ({format_size(file_size)}) to target...")
-        await user_client.send_file(
-            entity=target,
-            file=message.media,
-            caption=final_caption,
-            supports_streaming=True
-        )
-        settings["forwarded_count"] = settings.get("forwarded_count", 0) + 1
-        save_settings(settings)
-        logger.info("✅ Video forwarded successfully via cloud!")
-        return True
-
-    except Exception as e:
-        logger.warning(f"Cloud forward failed ({e}). Attempting download & upload fallback...")
+    # Retry loop for Telegram rate limits
+    for attempt in range(3):
         try:
-            temp_path = TEMP_DIR / f"fwd_{message.id}.mp4"
-            downloaded = await user_client.download_media(message, file=str(temp_path))
-            if not downloaded or not os.path.exists(downloaded):
-                raise Exception("Download failed")
-
+            # Strategy 1: Instant Cloud Forward (0 bandwidth)
+            logger.info(f"📤 Direct Cloud Uploading video ({format_size(file_size)}) to target...")
             await user_client.send_file(
                 entity=target,
-                file=downloaded,
+                file=message.media,
                 caption=final_caption,
                 supports_streaming=True
             )
-            try:
-                if os.path.exists(downloaded):
-                    os.remove(downloaded)
-            except Exception:
-                pass
-
             settings["forwarded_count"] = settings.get("forwarded_count", 0) + 1
             save_settings(settings)
-            logger.info("✅ Video forwarded successfully via fallback!")
+            logger.info("✅ Video forwarded successfully via cloud!")
             return True
-        except Exception as err:
-            logger.error(f"Fallback forward error: {err}")
-            return False
+
+        except FloodWaitError as flood:
+            wait_sec = flood.seconds + 2
+            logger.warning(f"Telegram FloodWait encountered: sleeping for {wait_sec}s...")
+            await asyncio.sleep(wait_sec)
+        except Exception as e:
+            logger.warning(f"Cloud forward failed ({e}). Attempting download & upload fallback...")
+            try:
+                temp_path = TEMP_DIR / f"fwd_{message.id}.mp4"
+                downloaded = await user_client.download_media(message, file=str(temp_path))
+                if not downloaded or not os.path.exists(downloaded):
+                    raise Exception("Download failed")
+
+                await user_client.send_file(
+                    entity=target,
+                    file=downloaded,
+                    caption=final_caption,
+                    supports_streaming=True
+                )
+                try:
+                    if os.path.exists(downloaded):
+                        os.remove(downloaded)
+                except Exception:
+                    pass
+
+                settings["forwarded_count"] = settings.get("forwarded_count", 0) + 1
+                save_settings(settings)
+                logger.info("✅ Video forwarded successfully via fallback!")
+                return True
+            except FloodWaitError as flood_fb:
+                wait_sec = flood_fb.seconds + 2
+                logger.warning(f"FloodWait on fallback: sleeping for {wait_sec}s...")
+                await asyncio.sleep(wait_sec)
+            except Exception as err:
+                logger.error(f"Fallback forward error: {err}")
+                return False
+    return False
 
 # ==================== REAL-TIME LISTENER (USER CLIENT) ====================
 
@@ -231,13 +242,123 @@ def get_main_menu_text() -> str:
         "⚡ **কী করতে চান? নিচের বাটনগুলো ব্যবহার করুন:**"
     )
 
+active_sync = {
+    "running": False,
+    "should_stop": False,
+    "source_id": None,
+    "source_title": "",
+    "copied": 0,
+    "chat_id": None,
+    "msg_id": None
+}
+
+async def run_bulk_sync(source_id, source_title, limit_count, reply_chat_id, status_msg_id):
+    """Background Worker that syncs 100 to 3,000+ videos continuously"""
+    active_sync["running"] = True
+    active_sync["should_stop"] = False
+    active_sync["source_id"] = source_id
+    active_sync["source_title"] = source_title
+    active_sync["copied"] = 0
+    active_sync["chat_id"] = reply_chat_id
+    active_sync["msg_id"] = status_msg_id
+
+    try:
+        source_entity = await user_client.get_entity(source_id)
+        target_title = settings.get("target_title", "🫦🫦🫦")
+        
+        limit_desc = f"{limit_count}টি" if limit_count else "সবগুলো (All 1000+)"
+        logger.info(f"🚀 Starting background bulk sync from [{source_title}] (Limit: {limit_desc})...")
+
+        copied = 0
+        found = 0
+        last_edit_time = 0
+
+        # If limit_count is None or >= 1000, we iterate all messages in the channel!
+        # reverse=True fetches from oldest to newest so they appear in original chronological order
+        iter_limit = limit_count if (limit_count and limit_count < 1000) else None
+
+        async for msg in user_client.iter_messages(source_entity, limit=iter_limit, reverse=True):
+            if active_sync["should_stop"]:
+                logger.info("🛑 Bulk sync cancelled by user.")
+                break
+
+            if is_video_message(msg):
+                found += 1
+                ok = await forward_video_core(msg, source_title)
+                if ok:
+                    copied += 1
+                    active_sync["copied"] = copied
+                    await asyncio.sleep(1.2)  # Safe delay between uploads
+
+                # Update progress in Telegram every 5 videos or every 8 seconds
+                now = asyncio.get_event_loop().time()
+                if (copied % 5 == 0 or now - last_edit_time > 8) and status_msg_id:
+                    last_edit_time = now
+                    try:
+                        progress_text = (
+                            f"🔄 **বাল্ক সিঙ্ক পুরোদমে চলছে (Bulk Sync Active)...**\n\n"
+                            f"📥 **সোর্স:** {source_title}\n"
+                            f"📤 **টার্গেট:** {target_title}\n"
+                            f"📊 **কপি সম্পন্ন:** `{copied}` টি ভিডিও\n"
+                            f"⏳ ক্লাউড সার্ভারে একা একাই চলছে (পিসি বন্ধ থাকলেও চলবে)\n\n"
+                            f"যেকোনো সময় থামাতে নিচের বাটনে চাপুন:"
+                        )
+                        await bot_client.edit_message(
+                            reply_chat_id,
+                            status_msg_id,
+                            progress_text,
+                            buttons=[[Button.inline("🛑 সিঙ্ক থামান (Stop Sync)", b"stop_sync")]]
+                        )
+                    except Exception:
+                        pass
+
+                if limit_count and copied >= limit_count:
+                    break
+
+        final_status = "🛑 **সিঙ্ক ব্যবহারকারী দ্বারা থামানো হয়েছে!**" if active_sync["should_stop"] else "🎉 **বাল্ক সিঙ্ক সফলভাবে সম্পূর্ণ হয়েছে!**"
+        final_text = (
+            f"{final_status}\n\n"
+            f"📥 **সোর্স:** {source_title}\n"
+            f"📤 **টার্গেট:** {target_title}\n"
+            f"✅ **মোট কপি করা হয়েছে:** `{copied}` টি ভিডিও\n"
+            f"📊 **সর্বমোট ফরোয়ার্ড সংখ্যা:** `{settings.get('forwarded_count', 0)}` টি"
+        )
+        await bot_client.edit_message(
+            reply_chat_id,
+            status_msg_id,
+            final_text,
+            buttons=[[Button.inline("🔙 মূল মেন্যু", b"refresh_status")]]
+        )
+
+    except Exception as e:
+        logger.error(f"Bulk sync error: {e}")
+        try:
+            await bot_client.edit_message(
+                reply_chat_id,
+                status_msg_id,
+                f"❌ সিঙ্ক চলাকালীন সমস্যা হয়েছে: `{e}`\n(কপি হয়েছিল: {copied} টি)",
+                buttons=[[Button.inline("🔙 মূল মেন্যু", b"refresh_status")]]
+            )
+        except Exception:
+            pass
+    finally:
+        active_sync["running"] = False
+
 def get_main_menu_buttons():
+    if active_sync["running"]:
+        return [
+            [Button.inline(f"🛑 সিঙ্ক চলছে ({active_sync['copied']}টি কপি)... থামাতে ক্লিক করুন", b"stop_sync")],
+            [Button.inline("🔄 প্রগ্রেস রিফ্রেশ করুন", b"refresh_status")]
+        ]
     return [
         [Button.inline("📋 সোর্স গ্রুপ নির্বাচন করুন (My Groups)", b"list_groups")],
         [
-            Button.inline("🔄 সিঙ্ক (১০টি)", b"sync_10"),
-            Button.inline("🔄 সিঙ্ক (২৫টি)", b"sync_25"),
-            Button.inline("🔄 সিঙ্ক (৫০টি)", b"sync_50")
+            Button.inline("🔄 ৫০টি", b"sync_50"),
+            Button.inline("🔄 ২০০টি", b"sync_200"),
+            Button.inline("🔄 ৫০০টি", b"sync_500")
+        ],
+        [
+            Button.inline("🚀 সব ভিডিও সিঙ্ক করুন (All 1000+ Videos)", b"sync_all")
         ],
         [
             Button.inline("⚙️ ক্যাপশন মোড পরিবর্তন", b"toggle_caption"),
@@ -254,6 +375,15 @@ async def bot_start_handler(event):
 @bot_client.on(events.CallbackQuery)
 async def bot_callback_handler(event):
     data = event.data
+
+    if data == b"stop_sync":
+        if active_sync["running"]:
+            active_sync["should_stop"] = True
+            await event.answer("🛑 সিঙ্ক থামানো হচ্ছে... অপেক্ষা করুন!", alert=True)
+        else:
+            await event.answer("কোনো সিঙ্ক চালু নেই।", alert=True)
+            await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
+        return
 
     if data == b"refresh_status":
         await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
@@ -274,9 +404,8 @@ async def bot_callback_handler(event):
             async for d in user_client.iter_dialogs():
                 if (d.is_channel or d.is_group) and d.id != settings.get("target_id"):
                     title = d.name[:25]
-                    # Inline callback data format: set_src_<id>
                     buttons.append([Button.inline(f"👉 {title}", f"set_src_{d.id}".encode())])
-                    if len(buttons) >= 10:  # Top 10 groups
+                    if len(buttons) >= 12:
                         break
 
             buttons.append([Button.inline("🔙 ফিরে যান", b"refresh_status")])
@@ -307,10 +436,12 @@ async def bot_callback_handler(event):
                 f"📥 **সোর্স গ্রুপ:** {title} (`{chat_id}`)\n"
                 f"📤 **টার্গেট গ্রুপ:** {settings.get('target_title', '🫦🫦🫦')}\n\n"
                 f"⚡ এখন থেকে **{title}** গ্রুপে যখনই কোনো নতুন ভিডিও পোস্ট হবে, "
-                f"কোনো মানুষের হাত দেওয়া ছাড়াই একা একাই আপনার টার্গেট গ্রুপে আপলোড হয়ে যাবে!"
+                f"অটোমেটিক একা একাই আপনার টার্গেট গ্রুপে আপলোড হয়ে যাবে!\n\n"
+                f"💡 **পুরোনো সব ভিডিও আনতে চাইলে নিচের যেকোনো একটি বাটনে চাপুন:**"
             )
             await event.edit(success_text, buttons=[
-                [Button.inline(f"🔄 {title} থেকে শেষ ১০টি ভিডিও কপি করুন", b"sync_10")],
+                [Button.inline(f"🔄 ৫০টি কপি", b"sync_50"), Button.inline(f"🔄 ২০০টি কপি", b"sync_200")],
+                [Button.inline(f"🚀 {title}-এর সব ভিডিও কপি করুন (All 1000+)", b"sync_all")],
                 [Button.inline("🔙 মূল মেন্যু", b"refresh_status")]
             ])
         except Exception as e:
@@ -319,8 +450,12 @@ async def bot_callback_handler(event):
         return
 
     if data.startswith(b"sync_"):
-        count_str = data.decode().replace("sync_", "")
-        limit = int(count_str)
+        if active_sync["running"]:
+            await event.answer("⚠️ অলরেডি একটি সিঙ্ক চলছে! আগে সেটি শেষ করুন বা বন্ধ করুন।", alert=True)
+            return
+
+        sync_type = data.decode().replace("sync_", "")
+        limit = None if sync_type == "all" else int(sync_type)
 
         source_id = settings.get("source_id")
         source_title = settings.get("source_title", "Source")
@@ -329,40 +464,18 @@ async def bot_callback_handler(event):
             await event.answer("⚠️ আগে কোনো সোর্স গ্রুপ সিলেক্ট করুন!", alert=True)
             return
 
-        status_msg = await event.edit(f"🔄 **{source_title}** থেকে শেষ {limit}টি ভিডিও খোঁজা হচ্ছে...")
+        limit_desc = "সবগুলো (All 1000+)" if limit is None else f"{limit}টি"
+        status_msg = await event.edit(
+            f"🚀 **{source_title}** থেকে {limit_desc} ভিডিও সিঙ্ক শুরু হচ্ছে...\n"
+            f"সার্ভারে ব্যাকগ্রাউন্ড টাস্ক প্রস্তুত করা হচ্ছে...",
+            buttons=[[Button.inline("🛑 সিঙ্ক বন্ধ করুন (Stop)", b"stop_sync")]]
+        )
 
-        try:
-            source_entity = await user_client.get_entity(source_id)
-            found = 0
-            copied = 0
-
-            async for msg in user_client.iter_messages(source_entity, limit=100):
-                if is_video_message(msg):
-                    found += 1
-                    try:
-                        await status_msg.edit(f"⏳ ভিডিও পাওয়া গেছে ({found}/{limit})! কপি করে টার্গেট গ্রুপে আপলোড হচ্ছে...")
-                    except Exception:
-                        pass
-
-                    ok = await forward_video_core(msg, source_title)
-                    if ok:
-                        copied += 1
-                        await asyncio.sleep(1.5)  # Safe flood delay
-                    if found >= limit:
-                        break
-
-            await status_msg.edit(
-                f"🎉 **সিঙ্ক সফলভাবে সম্পন্ন হয়েছে!**\n\n"
-                f"📥 **সোর্স:** {source_title}\n"
-                f"📤 **টার্গেট:** {settings.get('target_title', '🫦🫦🫦')}\n"
-                f"• মোট পাওয়া ভিডিও: {found} টি\n"
-                f"• সফলভাবে আপলোড হয়েছে: {copied} টি\n\n"
-                f"📊 সর্বমোট ফরোয়ার্ড: {settings.get('forwarded_count', 0)} টি",
-                buttons=[[Button.inline("🔙 মূল মেন্যু", b"refresh_status")]]
-            )
-        except Exception as e:
-            logger.error(f"Sync error: {e}")
-            await status_msg.edit(f"❌ সিঙ্ক করার সময় সমস্যা হয়েছে: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+        # Launch continuous background task so Telegram callback never times out
+        asyncio.create_task(
+            run_bulk_sync(source_id, source_title, limit, event.chat_id, status_msg.id)
+        )
+        return
 
 # Link or Direct Forward Handler in Bot Chat
 @bot_client.on(events.NewMessage)
