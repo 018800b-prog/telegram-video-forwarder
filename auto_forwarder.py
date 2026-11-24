@@ -48,8 +48,10 @@ DEFAULT_SETTINGS = {
     "source_id": -1004495534028,  # 🍑🍑🍑🍑
     "source_title": "🍑🍑🍑🍑",
     "source_ids": [-1004495534028],
-    "caption_mode": "original",
-    "forwarded_count": 0,
+    "caption_mode": "original",    # "original" | "none"
+    "media_filter": "video_only",  # "video_only" | "all_media"
+    "auto_forward_enabled": True,  # True | False
+    "forwarded_count": 1,
     "owner_id": 8721309931
 }
 
@@ -192,6 +194,13 @@ async def forward_video_core(message, source_name="Source") -> bool:
                 return False
     return False
 
+def is_eligible_media(message) -> bool:
+    """Checks if message matches the active media filter"""
+    m_filter = settings.get("media_filter", "video_only")
+    if m_filter == "all_media":
+        return bool(message and message.media)
+    return is_video_message(message)
+
 # ==================== REAL-TIME LISTENER (USER CLIENT) ====================
 
 @user_client.on(events.NewMessage)
@@ -199,11 +208,15 @@ async def on_user_new_message(event):
     if not event.chat_id:
         return
 
+    # Check if live auto-forwarding is enabled
+    if not settings.get("auto_forward_enabled", True):
+        return
+
     canonical_chat_id = to_canonical_id(event.chat_id)
     active_sources = get_active_source_canonical_ids()
 
     if canonical_chat_id in active_sources:
-        if is_video_message(event.message):
+        if is_eligible_media(event.message):
             source_title = settings.get("source_title", "Source Group")
             file_size = getattr(event.message.file, "size", 0) if event.message.file else 0
             logger.info(f"🚨 New video in [{source_title}] ({format_size(file_size)})! Auto-forwarding...")
@@ -225,22 +238,98 @@ async def on_user_new_message(event):
                 except Exception as notif_err:
                     logger.warning(f"Could not send bot notification: {notif_err}")
 
-# ==================== INTERACTIVE BOT UI (BOT CLIENT) ====================
+# ==================== INTERACTIVE BOT UI (100% BUTTON DRIVEN) ====================
 
 def get_main_menu_text() -> str:
     s_title = settings.get("source_title", "কোনোটি নির্বাচিত নেই")
     t_title = settings.get("target_title", "🫦🫦🫦")
     f_count = settings.get("forwarded_count", 0)
     c_mode = "আসল ক্যাপশন" if settings.get("caption_mode") == "original" else "ক্লিন (ক্যাপশন ছাড়া)"
+    m_filter = "শুধুমাত্র ভিডিও" if settings.get("media_filter") == "video_only" else "সব মিডিয়া (ভিডিও+ফটো)"
+    auto_status = "🟢 চালু আছে" if settings.get("auto_forward_enabled", True) else "🔴 বন্ধ আছে"
 
     return (
-        "🤖 **ভিডিও অটো-ফরোয়ার্ডার কন্ট্রোল প্যানেল**\n\n"
-        f"📥 **বর্তমান সোর্স গ্রুপ:** **{s_title}**\n"
+        "🤖 **ভিডিও অটো-ফরোয়ার্ডার কন্ট্রোল প্যানেল** 🚀\n\n"
+        f"📥 **সোর্স গ্রুপ:** **{s_title}**\n"
         f"📤 **টার্গেট গ্রুপ:** **{t_title}**\n"
+        f"⚡ **লাইভ অটো-ফরোয়ার্ড:** {auto_status}\n"
         f"📝 **ক্যাপশন স্টাইল:** {c_mode}\n"
-        f"📊 **সর্বমোট ফরোয়ার্ড করা ভিডিও:** {f_count} টি\n\n"
-        "⚡ **কী করতে চান? নিচের বাটনগুলো ব্যবহার করুন:**"
+        f"🎥 **মিডিয়া ফিল্টার:** {m_filter}\n"
+        f"📊 **সর্বমোট ফরোয়ার্ড ভিডিও:** `{f_count}` টি\n\n"
+        "👇 **কোনো কিছু টাইপ করতে হবে না! নিচের যেকোনো বোতামে চাপুন:**"
     )
+
+def get_main_menu_buttons():
+    if active_sync["running"]:
+        return [
+            [Button.inline(f"🛑 সিঙ্ক চলছে ({active_sync['copied']}টি কপি)... থামাতে চাপুন", b"stop_sync")],
+            [Button.inline("🔄 প্রগ্রেস রিফ্রেশ করুন", b"refresh_status")]
+        ]
+    return [
+        [Button.inline("📋 সোর্স গ্রুপ নির্বাচন করুন (My Groups)", b"list_groups_0")],
+        [Button.inline("🚀 সোর্স থেকে সব ভিডিও ফরোয়ার্ড করুন (All 1000+)", b"sync_all")],
+        [
+            Button.inline("🔄 ৫০টি কপি", b"sync_50"),
+            Button.inline("🔄 ২০০টি কপি", b"sync_200"),
+            Button.inline("🔄 ৫০০টি কপি", b"sync_500")
+        ],
+        [
+            Button.inline("📤 টার্গেট গ্রুপ বাছুন", b"list_targets_0"),
+            Button.inline("⚙️ সেটিংস ও ফিল্টার", b"open_settings")
+        ],
+        [Button.inline("🔄 স্ট্যাটাস রিফ্রেশ", b"refresh_status")]
+    ]
+
+def get_source_hub_text(title: str, chat_id: int) -> str:
+    t_title = settings.get("target_title", "🫦🫦🫦")
+    live_status = "🟢 চালু (নতুন ভিডিও আসামাত্রই যাবে)" if settings.get("auto_forward_enabled", True) else "🔴 বন্ধ"
+    return (
+        f"🎉 **সোর্স গ্রুপ সফলভাবে নির্বাচন করা হয়েছে!**\n\n"
+        f"👉 নির্বাচন করেছেন: **【 {title} 】** (`{chat_id}`)\n"
+        f"📤 ভিডিও জমা হবে: **{t_title}**\n"
+        f"⚡ লাইভ অটো-ফরোয়ার্ড: {live_status}\n\n"
+        "👇 **এখনই পুরোনো ভিডিও নিয়ে আসতে নিচের বোতামে চাপুন:**"
+    )
+
+def get_source_hub_buttons(title: str):
+    return [
+        [Button.inline(f"🚀 সব ভিডিও ফরোয়ার্ড করুন (All 1000+)", b"sync_all")],
+        [
+            Button.inline("🔄 ৫০টি কপি", b"sync_50"),
+            Button.inline("🔄 ২০০টি কপি", b"sync_200"),
+            Button.inline("🔄 ৫০০টি কপি", b"sync_500")
+        ],
+        [
+            Button.inline("📋 অন্য সোর্স গ্রুপ বাছুন", b"list_groups_0"),
+            Button.inline("⚙️ সেটিংস পরিবর্তন", b"open_settings")
+        ],
+        [Button.inline("🔙 মূল ড্যাশবোর্ড", b"refresh_status")]
+    ]
+
+def get_settings_text() -> str:
+    c_mode = "আসল ক্যাপশন রাখা হবে" if settings.get("caption_mode") == "original" else "ক্লিন (ক্যাপশন মুছে ফেলা হবে)"
+    m_filter = "শুধুমাত্র ভিডিও" if settings.get("media_filter") == "video_only" else "সব মিডিয়া (ভিডিও + ফটো)"
+    auto_status = "🟢 চালু (সোর্স গ্রুপে নতুন ভিডিও এলেই যাবে)" if settings.get("auto_forward_enabled", True) else "🔴 বন্ধ"
+
+    return (
+        "⚙️ **অটো-ফরোয়ার্ডার সেটিংস ও ফিল্টার কন্ট্রোল**\n\n"
+        f"⚡ **লাইভ অটো-ফরোয়ার্ড:** {auto_status}\n"
+        f"📝 **ক্যাপশন স্টাইল:** {c_mode}\n"
+        f"🎥 **মিডিয়া ফিল্টার:** {m_filter}\n\n"
+        "👇 পরিবর্তন করতে নিচের বোতামগুলোতে চাপুন:"
+    )
+
+def get_settings_buttons():
+    auto_btn = "🔴 অটো-ফরোয়ার্ড বন্ধ করুন" if settings.get("auto_forward_enabled", True) else "🟢 অটো-ফরোয়ার্ড চালু করুন"
+    cap_btn = "🧹 ক্লিন মোড (ক্যাপশন মুছুন)" if settings.get("caption_mode") == "original" else "📄 আসল ক্যাপশন রাখুন"
+    flt_btn = "📁 সব মিডিয়া পাঠান (ভিডিও+ফটো)" if settings.get("media_filter") == "video_only" else "🎥 শুধুমাত্র ভিডিও পাঠান"
+
+    return [
+        [Button.inline(auto_btn, b"toggle_auto_fwd")],
+        [Button.inline(cap_btn, b"toggle_caption")],
+        [Button.inline(flt_btn, b"toggle_media_filter")],
+        [Button.inline("🔙 মূল মেন্যুতে ফিরে যান", b"refresh_status")]
+    ]
 
 active_sync = {
     "running": False,
@@ -344,28 +433,6 @@ async def run_bulk_sync(source_id, source_title, limit_count, reply_chat_id, sta
     finally:
         active_sync["running"] = False
 
-def get_main_menu_buttons():
-    if active_sync["running"]:
-        return [
-            [Button.inline(f"🛑 সিঙ্ক চলছে ({active_sync['copied']}টি কপি)... থামাতে ক্লিক করুন", b"stop_sync")],
-            [Button.inline("🔄 প্রগ্রেস রিফ্রেশ করুন", b"refresh_status")]
-        ]
-    return [
-        [Button.inline("📋 সোর্স গ্রুপ নির্বাচন করুন (My Groups)", b"list_groups")],
-        [
-            Button.inline("🔄 ৫০টি", b"sync_50"),
-            Button.inline("🔄 ২০০টি", b"sync_200"),
-            Button.inline("🔄 ৫০০টি", b"sync_500")
-        ],
-        [
-            Button.inline("🚀 সব ভিডিও সিঙ্ক করুন (All 1000+ Videos)", b"sync_all")
-        ],
-        [
-            Button.inline("⚙️ ক্যাপশন মোড পরিবর্তন", b"toggle_caption"),
-            Button.inline("🔄 রিফ্রেশ স্ট্যাটাস", b"refresh_status")
-        ]
-    ]
-
 @bot_client.on(events.NewMessage(pattern=r"^/(start|menu)$"))
 async def bot_start_handler(event):
     if not event.is_private:
@@ -376,6 +443,7 @@ async def bot_start_handler(event):
 async def bot_callback_handler(event):
     data = event.data
 
+    # Stop active sync
     if data == b"stop_sync":
         if active_sync["running"]:
             active_sync["should_stop"] = True
@@ -385,39 +453,85 @@ async def bot_callback_handler(event):
             await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
         return
 
+    # Refresh main dashboard
     if data == b"refresh_status":
         await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
         return
 
-    if data == b"toggle_caption":
-        curr = settings.get("caption_mode", "original")
-        new_mode = "none" if curr == "original" else "original"
-        settings["caption_mode"] = new_mode
-        save_settings(settings)
-        await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
+    # Open Settings Submenu
+    if data == b"open_settings":
+        await event.edit(get_settings_text(), buttons=get_settings_buttons())
         return
 
-    if data == b"list_groups":
-        await event.edit("🔍 আপনার জয়েন করা গ্রুপ ও চ্যানেলসমূহ লোড করা হচ্ছে...")
-        buttons = []
-        try:
-            async for d in user_client.iter_dialogs():
-                if (d.is_channel or d.is_group) and d.id != settings.get("target_id"):
-                    title = d.name[:25]
-                    buttons.append([Button.inline(f"👉 {title}", f"set_src_{d.id}".encode())])
-                    if len(buttons) >= 12:
-                        break
+    # Toggle live auto-forwarding
+    if data == b"toggle_auto_fwd":
+        curr = settings.get("auto_forward_enabled", True)
+        settings["auto_forward_enabled"] = not curr
+        save_settings(settings)
+        await event.edit(get_settings_text(), buttons=get_settings_buttons())
+        return
 
-            buttons.append([Button.inline("🔙 ফিরে যান", b"refresh_status")])
+    # Toggle Caption Mode
+    if data == b"toggle_caption":
+        curr = settings.get("caption_mode", "original")
+        settings["caption_mode"] = "none" if curr == "original" else "original"
+        save_settings(settings)
+        await event.edit(get_settings_text(), buttons=get_settings_buttons())
+        return
+
+    # Toggle Media Filter (Video only vs All media)
+    if data == b"toggle_media_filter":
+        curr = settings.get("media_filter", "video_only")
+        settings["media_filter"] = "all_media" if curr == "video_only" else "video_only"
+        save_settings(settings)
+        await event.edit(get_settings_text(), buttons=get_settings_buttons())
+        return
+
+    # List Source Groups with Pagination
+    if data.startswith(b"list_groups_"):
+        page = int(data.decode().replace("list_groups_", ""))
+        await event.edit(f"🔍 আপনার গ্রুপ ও চ্যানেলসমূহ লোড হচ্ছে (পেজ {page + 1})...")
+        
+        all_dialogs = []
+        try:
+            target_id = settings.get("target_id")
+            async for d in user_client.iter_dialogs():
+                if (d.is_channel or d.is_group) and d.id != target_id:
+                    all_dialogs.append((d.name[:24], d.id))
+
+            # 8 groups per page
+            per_page = 8
+            total_pages = max(1, (len(all_dialogs) + per_page - 1) // per_page)
+            page = max(0, min(page, total_pages - 1))
+            current_slice = all_dialogs[page * per_page : (page + 1) * per_page]
+
+            buttons = []
+            for name, cid in current_slice:
+                buttons.append([Button.inline(f"👉 {name}", f"set_src_{cid}".encode())])
+
+            # Pagination row
+            nav_row = []
+            if page > 0:
+                nav_row.append(Button.inline("⬅️ আগের পেজ", f"list_groups_{page - 1}".encode()))
+            nav_row.append(Button.inline(f"📄 {page + 1}/{total_pages}", b"refresh_status"))
+            if page < total_pages - 1:
+                nav_row.append(Button.inline("পরের পেজ ➡️", f"list_groups_{page + 1}".encode()))
+            
+            if nav_row:
+                buttons.append(nav_row)
+
+            buttons.append([Button.inline("🔙 মূল ড্যাশবোর্ড", b"refresh_status")])
+
             await event.edit(
-                "📋 **যে গ্রুপ থেকে ভিডিও ফরোয়ার্ড করতে চান, সেটির ওপর ক্লিক করুন:**",
+                "📋 **যে গ্রুপ থেকে ভিডিও ফরোয়ার্ড করতে চান, সেটির ওপর চাপুন:**",
                 buttons=buttons
             )
         except Exception as e:
             logger.error(f"Error listing dialogs: {e}")
-            await event.edit(f"❌ গ্রুপ লোড করতে সমস্যা হয়েছে: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+            await event.edit(f"❌ গ্রুপ লোড করতে সমস্যা: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
         return
 
+    # Set Source Group -> Immediately shows Action Hub with Big "Forward All" Button!
     if data.startswith(b"set_src_"):
         chat_id_str = data.decode().replace("set_src_", "")
         chat_id = int(chat_id_str)
@@ -431,24 +545,82 @@ async def bot_callback_handler(event):
             settings["source_ids"] = [chat_id]
             save_settings(settings)
 
-            success_text = (
-                f"✅ **সোর্স গ্রুপ সফলভাবে নির্বাচন করা হয়েছে!**\n\n"
-                f"📥 **সোর্স গ্রুপ:** {title} (`{chat_id}`)\n"
-                f"📤 **টার্গেট গ্রুপ:** {settings.get('target_title', '🫦🫦🫦')}\n\n"
-                f"⚡ এখন থেকে **{title}** গ্রুপে যখনই কোনো নতুন ভিডিও পোস্ট হবে, "
-                f"অটোমেটিক একা একাই আপনার টার্গেট গ্রুপে আপলোড হয়ে যাবে!\n\n"
-                f"💡 **পুরোনো সব ভিডিও আনতে চাইলে নিচের যেকোনো একটি বাটনে চাপুন:**"
+            # Show the immediate Source Action Hub with the Big "Forward All" button
+            await event.edit(
+                get_source_hub_text(title, chat_id),
+                buttons=get_source_hub_buttons(title)
             )
-            await event.edit(success_text, buttons=[
-                [Button.inline(f"🔄 ৫০টি কপি", b"sync_50"), Button.inline(f"🔄 ২০০টি কপি", b"sync_200")],
-                [Button.inline(f"🚀 {title}-এর সব ভিডিও কপি করুন (All 1000+)", b"sync_all")],
-                [Button.inline("🔙 মূল মেন্যু", b"refresh_status")]
-            ])
         except Exception as e:
             logger.error(f"Error selecting source: {e}")
-            await event.edit(f"❌ সোর্স সেট করতে সমস্যা হয়েছে: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+            await event.edit(f"❌ সোর্স সেট করতে সমস্যা: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
         return
 
+    # List Target Groups with Pagination
+    if data.startswith(b"list_targets_"):
+        page = int(data.decode().replace("list_targets_", ""))
+        await event.edit(f"🔍 আপনার গ্রুপসমূহ লোড হচ্ছে (পেজ {page + 1})...")
+
+        all_dialogs = []
+        try:
+            async for d in user_client.iter_dialogs():
+                if d.is_channel or d.is_group:
+                    all_dialogs.append((d.name[:24], d.id))
+
+            per_page = 8
+            total_pages = max(1, (len(all_dialogs) + per_page - 1) // per_page)
+            page = max(0, min(page, total_pages - 1))
+            current_slice = all_dialogs[page * per_page : (page + 1) * per_page]
+
+            buttons = []
+            for name, cid in current_slice:
+                buttons.append([Button.inline(f"🎯 {name}", f"set_tgt_{cid}".encode())])
+
+            nav_row = []
+            if page > 0:
+                nav_row.append(Button.inline("⬅️ আগের পেজ", f"list_targets_{page - 1}".encode()))
+            nav_row.append(Button.inline(f"📄 {page + 1}/{total_pages}", b"refresh_status"))
+            if page < total_pages - 1:
+                nav_row.append(Button.inline("পরের পেজ ➡️", f"list_targets_{page + 1}".encode()))
+            
+            if nav_row:
+                buttons.append(nav_row)
+
+            buttons.append([Button.inline("🔙 মূল ড্যাশবোর্ড", b"refresh_status")])
+
+            await event.edit(
+                "📤 **যে গ্রুপে ভিডিওগুলো জমা হবে (টার্গেট গ্রুপ), সেটির ওপর চাপুন:**",
+                buttons=buttons
+            )
+        except Exception as e:
+            logger.error(f"Error listing target dialogs: {e}")
+            await event.edit(f"❌ লোড করতে সমস্যা: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+        return
+
+    # Set Target Group
+    if data.startswith(b"set_tgt_"):
+        chat_id_str = data.decode().replace("set_tgt_", "")
+        chat_id = int(chat_id_str)
+        try:
+            entity = await user_client.get_entity(chat_id)
+            title = getattr(entity, 'title', str(chat_id))
+            
+            settings["target_id"] = chat_id
+            settings["target_title"] = title
+            cached_target["entity"] = None
+            save_settings(settings)
+
+            await event.edit(
+                f"✅ **টার্গেট গ্রুপ সফলভাবে পরিবর্তিত হয়েছে!**\n\n"
+                f"📤 নতুন টার্গেট: **【 {title} 】** (`{chat_id}`)\n"
+                f"এখন থেকে সব ভিডিও এখানে জমা হবে।",
+                buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", b"refresh_status")]]
+            )
+        except Exception as e:
+            logger.error(f"Error setting target: {e}")
+            await event.edit(f"❌ টার্গেট সেট করতে সমস্যা: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+        return
+
+    # Sync past videos
     if data.startswith(b"sync_"):
         if active_sync["running"]:
             await event.answer("⚠️ অলরেডি একটি সিঙ্ক চলছে! আগে সেটি শেষ করুন বা বন্ধ করুন।", alert=True)
