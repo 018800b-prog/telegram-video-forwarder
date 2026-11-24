@@ -1,20 +1,25 @@
 """
-Telegram Automated Video Forwarder (Userbot Mode)
-=================================================
-এটি আপনার টেলিগ্রাম একাউন্ট দিয়ে স্বয়ংক্রিয়ভাবে সোর্স গ্রুপের সব নতুন ভিডিও 
-টার্গেট গ্রুপে (কোনো ফরওয়ার্ড ট্যাগ ছাড়া) আপলোড করে দেয়।
+Telegram Master Auto-Forwarder (Hybrid Dual-Engine)
+===================================================
+Engine 1: User Client (Telethon with SESSION_STRING)
+          - Can access all private groups, invite links, restricted content
+          - Listens to active source groups in real-time
+          - Copies videos to target group (🫦🫦🫦) without forward tags
 
-টার্গেট গ্রুপ: https://t.me/+5sUPS6kwiSE3ZGE1
-সোর্স গ্রুপ: ইচ্ছামতো পরিবর্তন করা যায় (.source কমান্ড দিয়ে)
+Engine 2: Bot Client (@autforwbdbot)
+          - Provides an interactive visual menu with buttons directly in Telegram
+          - Lets you select source groups with 1 click from your joined dialogs
+          - Syncs past videos on demand with progress updates
+          - Sends instant notifications when videos are auto-forwarded
 """
 
 import os
-import re
 import sys
+import json
 import asyncio
 import logging
 from pathlib import Path
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat, PeerChannel, PeerChat
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
@@ -23,275 +28,394 @@ from telethon.errors import UserAlreadyParticipantError
 from config import (
     API_ID,
     API_HASH,
+    BOT_TOKEN,
     BASE_DIR,
-    LOG_FORMAT,
-    runtime_settings,
-    update_runtime_setting
+    LOG_FORMAT
 )
-from utils import (
-    format_size,
-    generate_caption,
-    is_video_message,
-    clean_chat_input
-)
+from utils import format_size, generate_caption, is_video_message, clean_chat_input
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("AutoForwarder")
+logger = logging.getLogger("MasterForwarder")
 
 TEMP_DIR = BASE_DIR / "temp_media"
 TEMP_DIR.mkdir(exist_ok=True)
+SETTINGS_FILE = BASE_DIR / "settings.json"
 
-# Default Target Group specified by user
-DEFAULT_TARGET_LINK = "https://t.me/+5sUPS6kwiSE3ZGE1"
-
-# Load SESSION_STRING from env if available
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-
-if SESSION_STRING:
-    session = StringSession(SESSION_STRING)
-else:
-    session = str(BASE_DIR / "user_session")
-
-client = TelegramClient(session, API_ID, API_HASH)
-
-# Active state
-state = {
-    "target_entity": None,
-    "target_id": None,
-    "target_title": "Loading...",
-    "source_ids": set(),      # Set of chat_ids being monitored
-    "source_titles": {},      # chat_id -> title
-    "me_id": None
+# Default fallback settings
+DEFAULT_SETTINGS = {
+    "target_id": -1004402901248,  # 🫦🫦🫦
+    "target_title": "🫦🫦🫦",
+    "source_id": -1004495534028,  # 🍑🍑🍑🍑
+    "source_title": "🍑🍑🍑🍑",
+    "source_ids": [-1004495534028],
+    "caption_mode": "original",
+    "forwarded_count": 0,
+    "owner_id": 8721309931
 }
 
-def extract_invite_hash(link: str) -> str:
-    """Extracts hash from t.me/+hash or t.me/joinchat/hash"""
-    match = re.search(r'(?:https?://)?(?:www\.)?t\.me/(?:\+|joinchat/)([a-zA-Z0-9_-]+)', link.strip())
-    if match:
-        return match.group(1)
-    return ""
-
-async def resolve_or_join(chat_input):
-    """Resolves an entity, joining via invite link if necessary"""
-    s = str(chat_input).strip()
-    invite_hash = extract_invite_hash(s)
-    
-    if invite_hash:
+def load_settings() -> dict:
+    if SETTINGS_FILE.exists():
         try:
-            # Check or Import invite
-            try:
-                updates = await client(ImportChatInviteRequest(invite_hash))
-                if hasattr(updates, 'chats') and updates.chats:
-                    chat = updates.chats[0]
-                    return chat, chat.title, chat.id
-            except UserAlreadyParticipantError:
-                # Already in chat, resolve via CheckChatInviteRequest
-                check = await client(CheckChatInviteRequest(invite_hash))
-                if hasattr(check, 'chat'):
-                    return check.chat, check.chat.title, check.chat.id
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {**DEFAULT_SETTINGS, **data}
         except Exception as e:
-            logger.warning(f"Invite join error for {s}: {e}")
+            logger.error(f"Error loading settings: {e}")
+    return DEFAULT_SETTINGS.copy()
 
-    # Standard username or integer ID
-    clean = clean_chat_input(s)
+def save_settings(data: dict):
     try:
-        entity = await client.get_entity(clean)
-        title = getattr(entity, 'title', getattr(entity, 'username', str(entity.id)))
-        return entity, title, entity.id
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Failed to resolve {s}: {e}")
-        return None, None, None
+        logger.error(f"Error saving settings: {e}")
 
-async def forward_video(message, source_title="Source"):
-    """Copies and uploads video to target cleanly without forward tag"""
-    if not state["target_entity"]:
-        logger.warning("Target group not set yet!")
+settings = load_settings()
+
+def to_canonical_id(chat_id) -> int:
+    """Normalize any chat ID format (-100xxxx, -xxxx, xxxx) to plain integer"""
+    if not chat_id:
+        return 0
+    s = str(chat_id).strip()
+    if s.startswith("-100"):
+        return int(s[4:])
+    if s.startswith("-"):
+        return int(s[1:])
+    return int(s)
+
+def get_active_source_canonical_ids() -> set[int]:
+    ids = set()
+    s_id = settings.get("source_id")
+    if s_id:
+        ids.add(to_canonical_id(s_id))
+    for sid in settings.get("source_ids", []):
+        ids.add(to_canonical_id(sid))
+    return ids
+
+# Initialize Clients
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+if not SESSION_STRING:
+    # Try reading from .env directly
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+    SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+
+if not SESSION_STRING:
+    logger.error("SESSION_STRING is missing! Please login first via login.bat")
+    sys.exit(1)
+
+user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot_client = TelegramClient(str(BASE_DIR / "video_forwarder_bot"), API_ID, API_HASH)
+
+# Cached Entities
+cached_target = {"entity": None}
+
+async def get_target_entity():
+    """Ensure target entity is resolved and valid"""
+    if cached_target["entity"]:
+        return cached_target["entity"]
+    try:
+        target_id = settings.get("target_id", -1004402901248)
+        entity = await user_client.get_entity(target_id)
+        cached_target["entity"] = entity
+        return entity
+    except Exception as e:
+        logger.error(f"Failed to resolve target entity: {e}")
+        return None
+
+async def forward_video_core(message, source_name="Source") -> bool:
+    """Core function that uploads video to target cleanly"""
+    target = await get_target_entity()
+    if not target:
+        logger.error("Target entity is not ready!")
         return False
 
-    final_caption = generate_caption(message.text)
     file_size = getattr(message.file, "size", 0) if message.file else 0
+    caption_mode = settings.get("caption_mode", "original")
+    final_caption = message.text if caption_mode == "original" else None
 
     try:
-        # Strategy 1: Instant Cloud Forward (Zero bandwidth)
-        logger.info(f"Forwarding video ({format_size(file_size)}) to {state['target_title']}...")
-        await client.send_file(
-            entity=state["target_entity"],
+        # Strategy 1: Instant Cloud Forward (0 bandwidth)
+        logger.info(f"📤 Direct Cloud Uploading video ({format_size(file_size)}) to target...")
+        await user_client.send_file(
+            entity=target,
             file=message.media,
             caption=final_caption,
             supports_streaming=True
         )
-        logger.info("✅ Video uploaded cleanly via cloud!")
+        settings["forwarded_count"] = settings.get("forwarded_count", 0) + 1
+        save_settings(settings)
+        logger.info("✅ Video forwarded successfully via cloud!")
         return True
 
     except Exception as e:
-        logger.warning(f"Direct cloud upload failed ({e}). Attempting download & upload fallback...")
+        logger.warning(f"Cloud forward failed ({e}). Attempting download & upload fallback...")
         try:
             temp_path = TEMP_DIR / f"fwd_{message.id}.mp4"
-            downloaded = await client.download_media(message, file=str(temp_path))
-            
+            downloaded = await user_client.download_media(message, file=str(temp_path))
             if not downloaded or not os.path.exists(downloaded):
                 raise Exception("Download failed")
 
-            await client.send_file(
-                entity=state["target_entity"],
+            await user_client.send_file(
+                entity=target,
                 file=downloaded,
                 caption=final_caption,
                 supports_streaming=True
             )
-
             try:
                 if os.path.exists(downloaded):
                     os.remove(downloaded)
             except Exception:
                 pass
 
-            logger.info("✅ Video uploaded via fallback!")
+            settings["forwarded_count"] = settings.get("forwarded_count", 0) + 1
+            save_settings(settings)
+            logger.info("✅ Video forwarded successfully via fallback!")
             return True
         except Exception as err:
-            logger.error(f"Fallback upload error: {err}")
+            logger.error(f"Fallback forward error: {err}")
             return False
 
-# ==================== COMMAND HANDLERS (Saved Messages / Private) ====================
+# ==================== REAL-TIME LISTENER (USER CLIENT) ====================
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.(help|start)$"))
-async def cmd_help(event):
-    help_text = (
-        "🤖 **অটো-ফরোয়ার্ডার কমান্ডসমূহ (Saved Messages-এ লিখুন):**\n\n"
-        "• `.source <গ্রুপের_লিংক>` - নতুন সোর্স গ্রুপ সেট বা যুক্ত করুন\n"
-        "• `.target <গ্রুপের_লিংক>` - টার্গেট গ্রুপ পরিবর্তন করুন\n"
-        "• `.sources` - বর্তমানে কোন কোন গ্রুপ থেকে ভিডিও আসছে তার তালিকা\n"
-        "• `.removesource <গ্রুপের_লিংক বা ID>` - কোনো সোর্স গ্রুপ বাদ দিন\n"
-        "• `.sync <সংখ্যা>` - সোর্স গ্রুপের আগের ভিডিওগুলো এখনই কপি করতে (যেমন: `.sync 10`)\n"
-        "• `.status` - বর্তমান টার্গেট ও সোর্স গ্রুপের স্ট্যাটাস দেখুন\n\n"
-        f"🎯 **বর্তমান টার্গেট:** {state['target_title']}"
-    )
-    await event.reply(help_text)
-
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.target(?:\s+(.+))?$"))
-async def cmd_set_target(event):
-    link = event.pattern_match.group(1)
-    if not link:
-        await event.reply(f"📌 বর্তমান টার্গেট গ্রুপ: **{state['target_title']}** (`{state['target_id']}`)")
-        return
-
-    status_msg = await event.reply("🔍 টার্গেট গ্রুপ কানেক্ট করা হচ্ছে...")
-    entity, title, chat_id = await resolve_or_join(link)
-    if entity:
-        state["target_entity"] = entity
-        state["target_id"] = chat_id
-        state["target_title"] = title
-        update_runtime_setting("target_chat_id", chat_id)
-        await status_msg.edit(f"✅ **নতুন টার্গেট গ্রুপ সেট হয়েছে!**\n🏷️ **নাম:** {title}\n🆔 **ID:** `{chat_id}`")
-    else:
-        await status_msg.edit("❌ টার্গেট গ্রুপ কানেক্ট করা যায়নি। লিংকটি সঠিক কিনা যাচাই করুন।")
-
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.source(?:\s+(.+))?$"))
-async def cmd_add_source(event):
-    link = event.pattern_match.group(1)
-    if not link:
-        await event.reply("ব্যবহারবিধি: `.source <সোর্স_গ্রুপের_লিংক>`\n(উদাহরণ: `.source https://t.me/+xxxx` অথবা `.source @channel`)")
-        return
-
-    status_msg = await event.reply("🔍 সোর্স গ্রুপ ভেরিফাই করা হচ্ছে...")
-    entity, title, chat_id = await resolve_or_join(link)
-    
-    if entity:
-        state["source_ids"].add(chat_id)
-        state["source_titles"][chat_id] = title
-        update_runtime_setting("source_chat_id", chat_id)
-        await status_msg.edit(
-            f"🎉 **সোর্স গ্রুপ সফলভাবে যুক্ত হয়েছে!**\n\n"
-            f"📥 **সোর্স:** {title} (`{chat_id}`)\n"
-            f"📤 **ভিডিও জমা হবে (টার্গেট):** {state['target_title']}\n\n"
-            f"⚡ এখন থেকে এই সোর্স গ্রুপে কোনো নতুন ভিডিও আসলে কোনো মানুষের হাত দেওয়া ছাড়াই "
-            f"অটোমেটিক আপনার টার্গেট গ্রুপে আপলোড হয়ে যাবে!"
-        )
-    else:
-        await status_msg.edit("❌ সোর্স গ্রুপটিতে কানেক্ট করা যায়নি। লিংকটি সঠিক কিনা চেক করুন।")
-
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.sources$"))
-async def cmd_list_sources(event):
-    if not state["source_ids"]:
-        await event.reply("⚠️ বর্তমানে কোনো সোর্স গ্রুপ যুক্ত নেই।\nযুক্ত করতে লিখুন: `.source <লিংক>`")
-        return
-
-    text = "📋 **বর্তমানে সক্রিয় সোর্স গ্রুপসমূহ (Auto-Monitoring):**\n\n"
-    for idx, sid in enumerate(state["source_ids"], 1):
-        name = state["source_titles"].get(sid, str(sid))
-        text += f"{idx}. **{name}** (`{sid}`)\n"
-    
-    text += f"\n📤 **ভিডিও যাচ্ছে:** {state['target_title']}"
-    await event.reply(text)
-
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.sync(?:\s+(\d+))?$"))
-async def cmd_sync(event):
-    """Sync past videos from the latest source group"""
-    if not state["source_ids"]:
-        await event.reply("⚠️ কোনো সোর্স গ্রুপ নেই। আগে `.source <লিংক>` দিন।")
-        return
-
-    limit_str = event.pattern_match.group(1)
-    limit = int(limit_str) if limit_str else 10
-    limit = min(limit, 50)
-
-    # Pick the latest added source
-    source_id = list(state["source_ids"])[-1]
-    source_name = state["source_titles"].get(source_id, str(source_id))
-
-    status_msg = await event.reply(f"🔄 **{source_name}** থেকে শেষ {limit}টি ভিডিও খোঁজা হচ্ছে...")
-
-    found = 0
-    copied = 0
-    try:
-        async for msg in client.iter_messages(source_id, limit=100):
-            if is_video_message(msg):
-                found += 1
-                await status_msg.edit(f"⏳ ভিডিও পাওয়া গেছে ({found}/{limit})! কপি করে টার্গেট গ্রুপে আপলোড হচ্ছে...")
-                ok = await forward_video(msg, source_name)
-                if ok:
-                    copied += 1
-                    await asyncio.sleep(1.5)
-                if found >= limit:
-                    break
-
-        await status_msg.edit(
-            f"🎉 **সিঙ্ক সম্পন্ন হয়েছে!**\n\n"
-            f"• মোট পাওয়া ভিডিও: {found} টি\n"
-            f"• সফলভাবে আপলোড হয়েছে: {copied} টি\n"
-            f"• টার্গেট গ্রুপ: {state['target_title']}"
-        )
-    except Exception as e:
-        logger.error(f"Sync error: {e}")
-        await status_msg.edit(f"❌ সমস্যা হয়েছে: `{e}`")
-
-# ==================== REAL-TIME LISTENER ====================
-
-@client.on(events.NewMessage)
-async def live_video_listener(event):
-    """Listens for new video messages in all monitored source groups"""
+@user_client.on(events.NewMessage)
+async def on_user_new_message(event):
     if not event.chat_id:
         return
 
-    # Check if incoming message is from any of our monitored source groups
-    # Support both regular chat_id and -100 format matching
-    matched_id = None
-    if event.chat_id in state["source_ids"]:
-        matched_id = event.chat_id
-    elif int(str(event.chat_id).replace("-100", "-")) in state["source_ids"]:
-        matched_id = event.chat_id
+    canonical_chat_id = to_canonical_id(event.chat_id)
+    active_sources = get_active_source_canonical_ids()
 
-    if matched_id:
+    if canonical_chat_id in active_sources:
         if is_video_message(event.message):
-            src_name = state["source_titles"].get(matched_id, "Source Group")
-            logger.info(f"🚨 New video in source group [{src_name}]! Auto-forwarding to {state['target_title']}...")
-            await forward_video(event.message, src_name)
+            source_title = settings.get("source_title", "Source Group")
+            file_size = getattr(event.message.file, "size", 0) if event.message.file else 0
+            logger.info(f"🚨 New video in [{source_title}] ({format_size(file_size)})! Auto-forwarding...")
 
-# ==================== CLOUD HEALTH CHECK ====================
+            success = await forward_video_core(event.message, source_title)
+            
+            # Send notification to Owner via Bot
+            if success:
+                owner_id = settings.get("owner_id", 8721309931)
+                try:
+                    await bot_client.send_message(
+                        owner_id,
+                        f"🎬 **নতুন ভিডিও সফলভাবে ফরোয়ার্ড হয়েছে!**\n\n"
+                        f"📥 **সোর্স:** {source_title}\n"
+                        f"📤 **টার্গেট:** {settings.get('target_title', '🫦🫦🫦')}\n"
+                        f"📁 **সাইজ:** {format_size(file_size)}\n"
+                        f"📊 **সর্বমোট ফরোয়ার্ড:** {settings.get('forwarded_count', 0)} টি"
+                    )
+                except Exception as notif_err:
+                    logger.warning(f"Could not send bot notification: {notif_err}")
+
+# ==================== INTERACTIVE BOT UI (BOT CLIENT) ====================
+
+def get_main_menu_text() -> str:
+    s_title = settings.get("source_title", "কোনোটি নির্বাচিত নেই")
+    t_title = settings.get("target_title", "🫦🫦🫦")
+    f_count = settings.get("forwarded_count", 0)
+    c_mode = "আসল ক্যাপশন" if settings.get("caption_mode") == "original" else "ক্লিন (ক্যাপশন ছাড়া)"
+
+    return (
+        "🤖 **ভিডিও অটো-ফরোয়ার্ডার কন্ট্রোল প্যানেল**\n\n"
+        f"📥 **বর্তমান সোর্স গ্রুপ:** **{s_title}**\n"
+        f"📤 **টার্গেট গ্রুপ:** **{t_title}**\n"
+        f"📝 **ক্যাপশন স্টাইল:** {c_mode}\n"
+        f"📊 **সর্বমোট ফরোয়ার্ড করা ভিডিও:** {f_count} টি\n\n"
+        "⚡ **কী করতে চান? নিচের বাটনগুলো ব্যবহার করুন:**"
+    )
+
+def get_main_menu_buttons():
+    return [
+        [Button.inline("📋 সোর্স গ্রুপ নির্বাচন করুন (My Groups)", b"list_groups")],
+        [
+            Button.inline("🔄 সিঙ্ক (১০টি)", b"sync_10"),
+            Button.inline("🔄 সিঙ্ক (২৫টি)", b"sync_25"),
+            Button.inline("🔄 সিঙ্ক (৫০টি)", b"sync_50")
+        ],
+        [
+            Button.inline("⚙️ ক্যাপশন মোড পরিবর্তন", b"toggle_caption"),
+            Button.inline("🔄 রিফ্রেশ স্ট্যাটাস", b"refresh_status")
+        ]
+    ]
+
+@bot_client.on(events.NewMessage(pattern=r"^/(start|menu)$"))
+async def bot_start_handler(event):
+    if not event.is_private:
+        return
+    await event.reply(get_main_menu_text(), buttons=get_main_menu_buttons())
+
+@bot_client.on(events.CallbackQuery)
+async def bot_callback_handler(event):
+    data = event.data
+
+    if data == b"refresh_status":
+        await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
+        return
+
+    if data == b"toggle_caption":
+        curr = settings.get("caption_mode", "original")
+        new_mode = "none" if curr == "original" else "original"
+        settings["caption_mode"] = new_mode
+        save_settings(settings)
+        await event.edit(get_main_menu_text(), buttons=get_main_menu_buttons())
+        return
+
+    if data == b"list_groups":
+        await event.edit("🔍 আপনার জয়েন করা গ্রুপ ও চ্যানেলসমূহ লোড করা হচ্ছে...")
+        buttons = []
+        try:
+            async for d in user_client.iter_dialogs():
+                if (d.is_channel or d.is_group) and d.id != settings.get("target_id"):
+                    title = d.name[:25]
+                    # Inline callback data format: set_src_<id>
+                    buttons.append([Button.inline(f"👉 {title}", f"set_src_{d.id}".encode())])
+                    if len(buttons) >= 10:  # Top 10 groups
+                        break
+
+            buttons.append([Button.inline("🔙 ফিরে যান", b"refresh_status")])
+            await event.edit(
+                "📋 **যে গ্রুপ থেকে ভিডিও ফরোয়ার্ড করতে চান, সেটির ওপর ক্লিক করুন:**",
+                buttons=buttons
+            )
+        except Exception as e:
+            logger.error(f"Error listing dialogs: {e}")
+            await event.edit(f"❌ গ্রুপ লোড করতে সমস্যা হয়েছে: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+        return
+
+    if data.startswith(b"set_src_"):
+        chat_id_str = data.decode().replace("set_src_", "")
+        chat_id = int(chat_id_str)
+        
+        try:
+            entity = await user_client.get_entity(chat_id)
+            title = getattr(entity, 'title', str(chat_id))
+            
+            settings["source_id"] = chat_id
+            settings["source_title"] = title
+            settings["source_ids"] = [chat_id]
+            save_settings(settings)
+
+            success_text = (
+                f"✅ **সোর্স গ্রুপ সফলভাবে নির্বাচন করা হয়েছে!**\n\n"
+                f"📥 **সোর্স গ্রুপ:** {title} (`{chat_id}`)\n"
+                f"📤 **টার্গেট গ্রুপ:** {settings.get('target_title', '🫦🫦🫦')}\n\n"
+                f"⚡ এখন থেকে **{title}** গ্রুপে যখনই কোনো নতুন ভিডিও পোস্ট হবে, "
+                f"কোনো মানুষের হাত দেওয়া ছাড়াই একা একাই আপনার টার্গেট গ্রুপে আপলোড হয়ে যাবে!"
+            )
+            await event.edit(success_text, buttons=[
+                [Button.inline(f"🔄 {title} থেকে শেষ ১০টি ভিডিও কপি করুন", b"sync_10")],
+                [Button.inline("🔙 মূল মেন্যু", b"refresh_status")]
+            ])
+        except Exception as e:
+            logger.error(f"Error selecting source: {e}")
+            await event.edit(f"❌ সোর্স সেট করতে সমস্যা হয়েছে: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+        return
+
+    if data.startswith(b"sync_"):
+        count_str = data.decode().replace("sync_", "")
+        limit = int(count_str)
+
+        source_id = settings.get("source_id")
+        source_title = settings.get("source_title", "Source")
+
+        if not source_id:
+            await event.answer("⚠️ আগে কোনো সোর্স গ্রুপ সিলেক্ট করুন!", alert=True)
+            return
+
+        status_msg = await event.edit(f"🔄 **{source_title}** থেকে শেষ {limit}টি ভিডিও খোঁজা হচ্ছে...")
+
+        try:
+            source_entity = await user_client.get_entity(source_id)
+            found = 0
+            copied = 0
+
+            async for msg in user_client.iter_messages(source_entity, limit=100):
+                if is_video_message(msg):
+                    found += 1
+                    try:
+                        await status_msg.edit(f"⏳ ভিডিও পাওয়া গেছে ({found}/{limit})! কপি করে টার্গেট গ্রুপে আপলোড হচ্ছে...")
+                    except Exception:
+                        pass
+
+                    ok = await forward_video_core(msg, source_title)
+                    if ok:
+                        copied += 1
+                        await asyncio.sleep(1.5)  # Safe flood delay
+                    if found >= limit:
+                        break
+
+            await status_msg.edit(
+                f"🎉 **সিঙ্ক সফলভাবে সম্পন্ন হয়েছে!**\n\n"
+                f"📥 **সোর্স:** {source_title}\n"
+                f"📤 **টার্গেট:** {settings.get('target_title', '🫦🫦🫦')}\n"
+                f"• মোট পাওয়া ভিডিও: {found} টি\n"
+                f"• সফলভাবে আপলোড হয়েছে: {copied} টি\n\n"
+                f"📊 সর্বমোট ফরোয়ার্ড: {settings.get('forwarded_count', 0)} টি",
+                buttons=[[Button.inline("🔙 মূল মেন্যু", b"refresh_status")]]
+            )
+        except Exception as e:
+            logger.error(f"Sync error: {e}")
+            await status_msg.edit(f"❌ সিঙ্ক করার সময় সমস্যা হয়েছে: `{e}`", buttons=[[Button.inline("🔙 ফিরে যান", b"refresh_status")]])
+
+# Link or Direct Forward Handler in Bot Chat
+@bot_client.on(events.NewMessage)
+async def bot_message_handler(event):
+    if not event.is_private:
+        return
+    if event.raw_text and event.raw_text.startswith("/"):
+        return
+
+    user_text = event.raw_text.strip() if event.raw_text else ""
+
+    # Direct Video uploaded to Bot
+    if is_video_message(event.message):
+        status_msg = await event.reply("🎬 ভিডিও সনাক্ত হয়েছে! টার্গেট গ্রুপে আপলোড করা হচ্ছে...")
+        ok = await forward_video_core(event.message, "Direct")
+        if ok:
+            await status_msg.edit(f"✅ ভিডিও সফলভাবে **{settings.get('target_title', '🫦🫦🫦')}** গ্রুপে আপলোড হয়েছে!")
+        else:
+            await status_msg.edit("❌ ভিডিও আপলোড করতে সমস্যা হয়েছে।")
+        return
+
+    # Link pasted by user
+    if user_text and ("t.me/" in user_text or user_text.startswith("@")):
+        status_msg = await event.reply("🔍 লিংকটি যাচাই করা হচ্ছে...")
+        try:
+            clean = clean_chat_input(user_text)
+            entity = await user_client.get_entity(clean)
+            title = getattr(entity, 'title', getattr(entity, 'username', str(entity.id)))
+            
+            settings["source_id"] = entity.id
+            settings["source_title"] = title
+            settings["source_ids"] = [entity.id]
+            save_settings(settings)
+
+            await status_msg.edit(
+                f"✅ **নতুন সোর্স গ্রুপ যুক্ত হয়েছে:** **{title}** (`{entity.id}`)\n\n"
+                f"📤 **টার্গেট:** {settings.get('target_title', '🫦🫦🫦')}\n"
+                f"এখন থেকে এই গ্রুপের সব নতুন ভিডিও স্বয়ংক্রিয়ভাবে আপনার গ্রুপে চলে যাবে!",
+                buttons=[
+                    [Button.inline(f"🔄 {title} থেকে শেষ ১০টি ভিডিও কপি করুন", b"sync_10")],
+                    [Button.inline("🔙 মূল মেন্যু", b"refresh_status")]
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Error resolving pasted link: {e}")
+            await status_msg.edit(
+                f"❌ লিংকটি রিড করা যায়নি: `{e}`\n\n"
+                "💡 **টিপস:** সহজে সিলেক্ট করতে নিচের বাটনে ক্লিক করুন:",
+                buttons=[[Button.inline("📋 আমার গ্রুপ তালিকা থেকে বেছে নিন", b"list_groups")]]
+            )
+        return
+
+# ==================== CLOUD HEALTH SERVER ====================
 
 async def handle_health(reader, writer):
     try:
         await reader.read(1024)
-        body = b'{"status": "ok", "app": "Telegram Auto Forwarder Userbot"}'
+        body = b'{"status": "ok", "app": "Telegram Master Hybrid Forwarder"}'
         headers = (
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: application/json\r\n"
@@ -315,56 +439,48 @@ async def start_health_server():
     except Exception as e:
         logger.warning(f"Health server failed on port {port}: {e}")
 
-# ==================== MAIN ====================
+# ==================== MAIN RUNNER ====================
 
 async def main():
     print("=" * 60)
-    print("🚀 Telegram Automated Video Forwarder (Userbot Mode)")
+    print("🚀 Telegram Master Auto-Forwarder (Dual-Engine Live)")
     print("=" * 60)
 
-    # Start health server for Render/UptimeRobot
+    # 1. Start HTTP health check for Render & UptimeRobot
     asyncio.create_task(start_health_server())
 
-    await client.start()
-    me = await client.get_me()
-    state["me_id"] = me.id
-    print(f"✅ লগিন সফল হয়েছে: {me.first_name} (@{me.username})")
+    # 2. Start User Client
+    print("Connecting User Account Client...")
+    await user_client.start()
+    me_user = await user_client.get_me()
+    print(f"✅ User Client Online: {me_user.first_name} (ID: {me_user.id})")
 
-    # Connect default target group
-    print(f"🔍 টার্গেট গ্রুপ কানেক্ট করা হচ্ছে: {DEFAULT_TARGET_LINK} ...")
-    t_entity, t_title, t_id = await resolve_or_join(DEFAULT_TARGET_LINK)
-    if t_entity:
-        state["target_entity"] = t_entity
-        state["target_title"] = t_title
-        state["target_id"] = t_id
-        print(f"🎯 টার্গেট গ্রুপ সক্রিয়: {t_title} (ID: {t_id})")
+    # 3. Start Bot Client
+    print("Connecting Bot Client...")
+    await bot_client.start(bot_token=BOT_TOKEN)
+    me_bot = await bot_client.get_me()
+    print(f"✅ Bot Client Online: @{me_bot.username} (ID: {me_bot.id})")
+
+    # 4. Resolve Target Entity
+    target = await get_target_entity()
+    if target:
+        print(f"🎯 Target Group Ready: {settings.get('target_title')} (ID: {settings.get('target_id')})")
     else:
-        print("⚠️ ডিফল্ট টার্গেট গ্রুপ এখনো কানেক্ট হয়নি। Telegram-এ .target <লিংক> দিয়ে সেট করতে পারেন।")
+        print("⚠️ Warning: Target Group could not be resolved!")
 
-    # If any previous source_chat_id in settings, add it
-    saved_source = runtime_settings.get("source_chat_id")
-    if saved_source:
-        try:
-            s_entity, s_title, s_id = await resolve_or_join(saved_source)
-            if s_entity:
-                state["source_ids"].add(s_id)
-                state["source_titles"][s_id] = s_title
-                print(f"📥 পূর্বের সোর্স গ্রুপ লোড হয়েছে: {s_title} ({s_id})")
-        except Exception:
-            pass
-
+    print(f"📥 Active Source Group: {settings.get('source_title')} (ID: {settings.get('source_id')})")
     print("=" * 60)
-    print("⚡ অটো-ফরোয়ার্ডার প্রস্তুত!")
-    print("💡 টেলিগ্রামের যেকোনো চ্যাট বা 'Saved Messages'-এ লিখুন:")
-    print("   .source <সোর্স_গ্রুপের_লিংক>  -> নতুন সোর্স গ্রুপ অ্যাড করতে")
-    print("   .sync 10                      -> সোর্স থেকে আগের ১০টি ভিডিও কপি করতে")
-    print("   .help                         -> সব কমান্ড দেখতে")
+    print("✨ All Systems Operational! Forwarder is Active 24/7.")
     print("=" * 60)
 
-    await client.run_until_disconnected()
+    # Keep both clients running
+    await asyncio.gather(
+        user_client.run_until_disconnected(),
+        bot_client.run_until_disconnected()
+    )
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 বন্ধ করা হয়েছে।")
+        print("\n🛑 Stopped.")
