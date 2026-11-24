@@ -104,8 +104,13 @@ if not SESSION_STRING:
     logger.error("SESSION_STRING is missing! Please login first via login.bat")
     sys.exit(1)
 
+BOT_SESSION_STRING = os.getenv(
+    "BOT_SESSION_STRING",
+    "1BVtsOHEBu4SgSeGUhFYOYVSIjlZB2m_DrLe39cVmVULZcfRMcyoNjWq6BnomwbtrDY8crG4_kFj9nmE3zgOMlESW5zJoop1d6SppNKYR4Odjnf6xVGGM1086cPuVNeSvYPW0yT6h2tpBkv0uNsYJtwlp1qC8ob-0mKruMwX6y2vY_LPHSop8wXzuvP58VYpbnYjZqcyi2AKzuwrEIb926-ravhUQ_BsB34cLjWoz7xt4wkaRLlhmb2YsaMTVSsxpqZQ2QnsJ4jfCAxelHXXx7Wme3d_dZnNAsXGAlEplRHYII2VCRenyVU1XydwTI7S0CxWuIPVPU6hKGZLdDr8UgNYg8dEP9to="
+).strip()
+
 user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-bot_client = TelegramClient(str(BASE_DIR / "video_forwarder_bot"), API_ID, API_HASH)
+bot_client = TelegramClient(StringSession(BOT_SESSION_STRING), API_ID, API_HASH)
 
 # Cached Entities
 cached_target = {"entity": None}
