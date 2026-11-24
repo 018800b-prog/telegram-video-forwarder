@@ -1,12 +1,21 @@
 {
-  "target_id": -1004402901248,
-  "target_title": "🫦🫦🫦",
-  "source_id": -1004495534028,
-  "source_title": "🍑🍑🍑🍑",
+  "target_ids": [
+    -1004402901248
+  ],
+  "target_titles": {
+    "-1004402901248": "🫦🫦🫦"
+  },
   "source_ids": [
     -1004495534028
   ],
+  "source_titles": {
+    "-1004495534028": "🍑🍑🍑🍑"
+  },
+  "duplicate_protection": true,
+  "seen_fingerprints": [],
+  "auto_forward_enabled": true,
   "caption_mode": "original",
-  "forwarded_count": 1,
+  "media_filter": "video_only",
+  "forwarded_count": 13,
   "owner_id": 8721309931
 }
