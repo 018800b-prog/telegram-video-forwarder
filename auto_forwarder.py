@@ -309,6 +309,65 @@ active_syncs: dict[str, dict] = {}
 recent_dispatched: dict[tuple[str, int, int], float] = {}
 # Cache canonical IDs of source chats that forbid direct cloud forwarding (avoids wasted RPC per video)
 restricted_source_chats: set[int] = set()
+# Per-account FloodWait unlock epoch timestamp & adaptive batch spacing delay
+account_flood_until: dict[int, float] = {}
+account_pace_delay: dict[int, float] = {}
+
+async def wait_out_flood(
+    acc_id: int | None,
+    seconds: int,
+    *,
+    reply_chat_id: int | None = None,
+    status_msg_id: int | None = None,
+    prof_key: str = "",
+    copied: int = 0,
+    should_stop_fn=None,
+):
+    """
+    Waits out Telegram FloodWait safely in cancelable 2s steps, bumps adaptive pacing,
+    and updates the Telegram UI live with exact Bangladesh unlock clock & switch-account button.
+    """
+    now_ts = time.time()
+    target_ts = now_ts + max(1, seconds) + 2
+    if acc_id:
+        account_flood_until[acc_id] = max(account_flood_until.get(acc_id, 0.0), target_ts)
+        cur_pace = account_pace_delay.get(acc_id, 1.5)
+        account_pace_delay[acc_id] = min(max(cur_pace * 1.5, 2.8), 6.0)
+
+    last_ui = 0.0
+    while True:
+        if should_stop_fn and should_stop_fn():
+            return
+        rem = int(target_ts - time.time())
+        if rem <= 0:
+            break
+
+        now_m = time.monotonic()
+        if reply_chat_id and status_msg_id and (now_m - last_ui >= (45.0 if rem > 90 else 15.0)):
+            last_ui = now_m
+            unlock_dt = datetime.fromtimestamp(target_ts, tz=BST_TZ).strftime("%I:%M %p")
+            mins, secs = divmod(rem, 60)
+            dur_txt = f"{mins} মিনিট {secs} সেকেন্ড" if mins else f"{secs} সেকেন্ড"
+            btns = [[Button.inline("🛑 সিঙ্ক বন্ধ করুন (Stop)", f"stop:{prof_key}".encode())]]
+            if prof_key:
+                btns.append([Button.inline("👤 অন্য অ্যাকাউন্ট দিয়ে চালাতে চাপুন", f"acc:{prof_key}".encode())])
+            try:
+                await bot_client.edit_message(
+                    reply_chat_id,
+                    status_msg_id,
+                    f"⏳ <b>টেলিগ্রাম স্প্যাম-গার্ড বিরতি (অটো চলবে)</b>\n\n"
+                    f"📥 একটানা দ্রুত ফরোয়ার্ডের কারণে টেলিগ্রাম সার্ভার এই অ্যাকাউন্টটিকে সাময়িক বিরতি দিয়েছে।\n"
+                    f"🕒 <b>বাকি সময়:</b> <code>{dur_txt}</code> (অটো চালু হবে: <b>{unlock_dt}</b>)\n"
+                    f"✅ এখন পর্যন্ত ফরোয়ার্ড হয়েছে: <code>{copied}</code> টি ভিডিও\n\n"
+                    f"💡 <i>বট বন্ধ হয়নি—সময় শেষ হলেই ঠিক এখান থেকেই আবার শুরু হবে! চাইলে নিচ থেকে অন্য অ্যাকাউন্ট ব্যবহার করতে পারেন।</i>",
+                    buttons=btns,
+                )
+            except MessageNotModifiedError:
+                pass
+            except Exception:
+                pass
+
+        await asyncio.sleep(min(2.0, max(0.2, target_ts - time.time())))
 
 def get_active_sync(prof_key: str) -> dict:
     prof_key = str(prof_key)
@@ -711,7 +770,7 @@ async def resolve_profile_key_from_chat(event) -> tuple[str, int | None]:
 
 FAST_CHUNK_SIZE = 512 * 1024  # 512 KB (maximum Telegram MTProto chunk size)
 TRANSFER_CONCURRENCY = 4      # Balanced 4x512KB=2MB pipeline per file (prevents DC4 timeouts)
-BULK_BATCH_SIZE = 20          # Unrestricted cloud-forward batch size per RPC
+BULK_BATCH_SIZE = 15          # Safe batch size per ForwardMessagesRequest to prevent 1h flood bans
 
 def _record_fingerprint_and_count(profile: dict, fp: str, count: int = 1, defer_save: bool = False):
     """Records seen fingerprint and bumps forwarded count safely after confirmed send."""
@@ -928,9 +987,9 @@ async def fast_upload_file(client: TelegramClient, filepath: Path, file_name: st
                             return
                         raise RuntimeError(f"Telegram rejected part {idx}/{part_count}")
                     except FloodWaitError as fl:
-                        wait_s = min(fl.seconds + 1, 60)
-                        logger.warning(f"Upload FloodWait ({fl.seconds}s) -> sleeping {wait_s}s")
-                        await asyncio.sleep(wait_s)
+                        wait_s = fl.seconds + 1
+                        logger.warning(f"Upload FloodWait ({fl.seconds}s) -> waiting {wait_s}s cleanly...")
+                        await wait_out_flood(None, wait_s)
                     except (asyncio.TimeoutError, tl_errors.TimedOutError, ConnectionError):
                         if attempt == 3:
                             raise
@@ -953,15 +1012,16 @@ async def upload_file_with_retry(
     attributes=None,
     thumb=None,
     mime_type=None,
+    flood_cb=None,
 ):
-    """Send file with pipelined 512KB upload for local files & FloodWait retry loop."""
+    """Send file with pipelined 512KB upload for local files & full FloodWait retry loop."""
     send_file_obj = file_obj
     if isinstance(file_obj, (str, Path)):
         fp = Path(file_obj)
         if fp.exists() and fp.stat().st_size >= FAST_CHUNK_SIZE and (attributes or not utils.is_image(str(fp))):
             send_file_obj = await fast_upload_file(upload_client, fp, fp.name)
 
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             kwargs = {
                 "entity": target_entity,
@@ -978,10 +1038,12 @@ async def upload_file_with_retry(
                 kwargs["mime_type"] = mime_type
             return await upload_client.send_file(**kwargs)
         except FloodWaitError as flood:
-            wait_sec = min(flood.seconds + 2, 120)
-            logger.warning(f"FloodWait ({flood.seconds}s): sleeping {wait_sec}s before retry...")
-            await asyncio.sleep(wait_sec)
-            if attempt == 2:
+            logger.warning(f"SendMedia FloodWait ({flood.seconds}s): pausing before retry...")
+            if flood_cb:
+                await flood_cb(flood.seconds)
+            else:
+                await wait_out_flood(None, flood.seconds)
+            if attempt == 3:
                 raise
     return None
 
@@ -1040,6 +1102,7 @@ async def distribute_video(
     preloaded: dict | None = None,
     target_ids_override: list[int] | None = None,
     defer_save: bool = False,
+    flood_cb=None,
 ) -> list[str]:
     """
     Ultra-fast hybrid distributor:
@@ -1102,6 +1165,13 @@ async def distribute_video(
                 payload = await prepare_video_payload(source_client, message, src_canon, source_peer=source_chat_id)
         return payload
 
+    async def handle_flood(secs: int, client_used):
+        cid = acc_id if (client_used is primary_client) else None
+        if flood_cb:
+            await flood_cb(secs)
+        else:
+            await wait_out_flood(cid, secs)
+
     async def send_to_single_target(tgt_id: int, allow_cloud_probe: bool = True) -> str | None:
         nonlocal reusable_cloud_media, reusable_cloud_client
         target_title = profile.get("target_titles", {}).get(str(tgt_id), str(tgt_id))
@@ -1117,7 +1187,7 @@ async def distribute_video(
                 try:
                     sent_msg = await upload_file_with_retry(
                         u_client, tgt_ent, reusable_cloud_media,
-                        caption_text, caption_entities
+                        caption_text, caption_entities, flood_cb=flood_cb
                     )
                     if sent_msg:
                         return target_title
@@ -1133,9 +1203,12 @@ async def distribute_video(
                 and src_canon not in restricted_source_chats
             ):
                 # B1: Native ForwardMessagesRequest(drop_author=True) — fastest instant server copy
-                try:
-                    src_ent = await get_entity_safe(u_client, source_chat_id, u_key)
-                    if src_ent is not None:
+                b1_perm_skip = False
+                for _ in range(3):
+                    try:
+                        src_ent = await get_entity_safe(u_client, source_chat_id, u_key)
+                        if src_ent is None:
+                            break
                         drop_caps = profile.get("caption_mode", "original") != "original"
                         res_upd = await u_client(functions.messages.ForwardMessagesRequest(
                             from_peer=src_ent,
@@ -1153,25 +1226,32 @@ async def distribute_video(
                                     reusable_cloud_client = u_client
                                     break
                             return target_title
-                except ChatForwardsRestrictedError as e:
-                    restricted_source_chats.add(src_canon)
-                    logger.info(f"Source restricted ({type(e).__name__}) -> switching to turbo transfer")
-                except (ChatWriteForbiddenError, ChannelPrivateError, PeerIdInvalidError):
-                    continue
-                except FloodWaitError as fl:
-                    await asyncio.sleep(min(fl.seconds + 2, 60))
-                except Exception as fwd_e:
-                    err_s = str(fwd_e).lower()
-                    if "protected chat" in err_s or "forwards" in err_s or "chat_forwards_restricted" in err_s:
+                        break
+                    except ChatForwardsRestrictedError as e:
                         restricted_source_chats.add(src_canon)
-                        logger.info("Protected chat cached -> turbo transfer")
+                        logger.info(f"Source restricted ({type(e).__name__}) -> switching to turbo transfer")
+                        break
+                    except (ChatWriteForbiddenError, ChannelPrivateError, PeerIdInvalidError):
+                        b1_perm_skip = True
+                        break
+                    except FloodWaitError as fl:
+                        await handle_flood(fl.seconds, u_client)
+                        continue
+                    except Exception as fwd_e:
+                        err_s = str(fwd_e).lower()
+                        if "protected chat" in err_s or "forwards" in err_s or "chat_forwards_restricted" in err_s:
+                            restricted_source_chats.add(src_canon)
+                            logger.info("Protected chat cached -> turbo transfer")
+                        break
+                if b1_perm_skip:
+                    continue
 
                 # B2: Direct SendMedia cloud copy if B1 didn't handle & source still unrestricted
                 if src_canon not in restricted_source_chats:
                     try:
                         sent_msg = await upload_file_with_retry(
                             u_client, tgt_ent, message.media,
-                            caption_text, caption_entities
+                            caption_text, caption_entities, flood_cb=flood_cb
                         )
                         if sent_msg:
                             reusable_cloud_media = sent_msg.media
@@ -1209,6 +1289,7 @@ async def distribute_video(
                     attributes=p.get("video_attrs"),
                     thumb=p.get("thumb_path"),
                     mime_type=p.get("mime_type"),
+                    flood_cb=flood_cb,
                 )
                 if sent_msg:
                     if reusable_cloud_media is None:
@@ -1490,11 +1571,14 @@ async def _batch_forward_unrestricted(
     profile: dict,
     prof_key: str,
     target_ids: list[int],
+    flood_cb=None,
+    should_stop_fn=None,
 ) -> tuple[int, list]:
     """
-    Forwards up to 20 unrestricted videos per RPC via ForwardMessagesRequest(drop_author=True).
-    Splits failed batches per-message before ever falling back to download+upload.
-    Returns (forwarded_item_count, fallback_messages_requiring_download).
+    Forwards up to 15 unrestricted videos per RPC via ForwardMessagesRequest(drop_author=True).
+    - Respects account_flood_until & adaptive pacing to prevent hourly 3300s lockouts
+    - Waits out FloodWait cleanly once & retries the batch (NEVER splits FloodWait into 15-20x loops!)
+    - Only splits non-flood item errors per-message before falling back to download+upload
     """
     valid_targets = [tid for tid in target_ids if to_canonical_id(tid) != src_canon]
     if not valid_targets or not batch:
@@ -1508,9 +1592,24 @@ async def _batch_forward_unrestricted(
     bot_only_targets: list[int] = []
     fallback_msgs_by_id: dict[int, object] = {}
 
-    async def send_forward_ids(tgt_ent, tid: int, id_list: list[int]) -> tuple[bool, bool]:
-        """Returns (success, was_restricted)."""
-        for attempt in range(5):
+    async def handle_wait(secs: int):
+        if flood_cb:
+            await flood_cb(secs)
+        else:
+            await wait_out_flood(acc_id, secs, should_stop_fn=should_stop_fn)
+
+    async def send_forward_ids(tgt_ent, tid: int, id_list: list[int]) -> tuple[bool, bool, bool]:
+        """Returns (success, was_restricted, was_flood_aborted)."""
+        for attempt in range(4):
+            if should_stop_fn and should_stop_fn():
+                return False, False, True
+            rem_lock = int(account_flood_until.get(acc_id, 0.0) - time.time()) if acc_id else 0
+            if rem_lock > 2:
+                await handle_wait(rem_lock)
+                if should_stop_fn and should_stop_fn():
+                    return False, False, True
+
+            t0 = time.monotonic()
             try:
                 await src_client(functions.messages.ForwardMessagesRequest(
                     from_peer=s_entity,
@@ -1520,26 +1619,36 @@ async def _batch_forward_unrestricted(
                     drop_author=True,
                     drop_media_captions=drop_caps,
                 ))
-                return True, False
+                elapsed = time.monotonic() - t0
+                # Detect hidden Telethon internal flood sleep (>8s) and slow pacing proactively!
+                if acc_id and elapsed > 8.0:
+                    cur_p = account_pace_delay.get(acc_id, 1.5)
+                    new_p = min(max(cur_p * 1.4, 2.8), 6.0)
+                    account_pace_delay[acc_id] = new_p
+                    logger.info(f"⚠️ Internal Telegram flood pause detected ({elapsed:.1f}s); raising batch pace to {new_p:.1f}s")
+                    await asyncio.sleep(2.5)
+                return True, False, False
             except ChatForwardsRestrictedError:
                 restricted_source_chats.add(src_canon)
                 logger.info(f"Batch forward restricted on {s_title} -> switching to Turbo transfer")
-                return False, True
+                return False, True, False
             except FloodWaitError as fl:
-                wait_s = min(fl.seconds + 2, 120)
-                logger.warning(f"Batch Forward FloodWait ({fl.seconds}s): sleeping {wait_s}s...")
-                await asyncio.sleep(wait_s)
+                logger.warning(f"Batch Forward FloodWait ({fl.seconds}s) on [{acc_id}] -> handling cleanly")
+                await handle_wait(fl.seconds)
+                if should_stop_fn and should_stop_fn():
+                    return False, False, True
+                continue
             except (ChatWriteForbiddenError, ChannelPrivateError, PeerIdInvalidError):
                 bot_only_targets.append(tid)
-                return False, False
+                return False, False, False
             except Exception as e:
                 err_s = str(e).lower()
-                if "protected" in err_s or "chat_forwards_restricted" in err_s or "forward" in err_s and "restrict" in err_s:
+                if "protected" in err_s or "chat_forwards_restricted" in err_s or ("forward" in err_s and "restrict" in err_s):
                     restricted_source_chats.add(src_canon)
-                    return False, True
+                    return False, True, False
                 logger.warning(f"Batch RPC error on {tid} (count={len(id_list)}): {e}")
-                return False, False
-        return False, False
+                return False, False, False
+        return False, False, True
 
     for tid in valid_targets:
         tgt_ent = await get_entity_safe(src_client, tid, f"u_{acc_id}")
@@ -1547,20 +1656,24 @@ async def _batch_forward_unrestricted(
             bot_only_targets.append(tid)
             continue
 
-        ok, is_restr = await send_forward_ids(tgt_ent, tid, msg_ids)
+        ok, is_restr, hit_flood = await send_forward_ids(tgt_ent, tid, msg_ids)
         if is_restr:
             return 0, batch
+        if hit_flood:
+            return 0, []
         if ok:
             user_ok_targets += 1
             continue
 
-        # If target wasn't bot-only, retry each message individually so 1 bad message doesn't force 19 downloads!
+        # Only split into individual calls for non-flood item errors (never FloodWaitError)
         if tid not in bot_only_targets and len(batch) > 1:
             indiv_ok = 0
             for m in batch:
-                m_ok, m_restr = await send_forward_ids(tgt_ent, tid, [m.id])
+                m_ok, m_restr, m_flood = await send_forward_ids(tgt_ent, tid, [m.id])
                 if m_restr:
                     return 0, batch
+                if m_flood:
+                    break
                 if m_ok:
                     indiv_ok += 1
                 else:
@@ -1570,9 +1683,10 @@ async def _batch_forward_unrestricted(
         elif tid not in bot_only_targets:
             fallback_msgs_by_id[batch[0].id] = batch[0]
 
-    # Gentle spacing helps avoid repetitive 21s ForwardMessagesRequest flood waits
+    # Adaptive spacing prevents triggering Telegram's 1-hour 3300s ban after 2,000 videos
     if user_ok_targets > 0:
-        await asyncio.sleep(0.45)
+        pace_delay = account_pace_delay.get(acc_id, 1.4) if acc_id else 1.0
+        await asyncio.sleep(pace_delay)
 
     succeeded_msgs = [m for m in batch if m.id not in fallback_msgs_by_id]
     rej_msgs = list(fallback_msgs_by_id.values())
@@ -1586,7 +1700,7 @@ async def _batch_forward_unrestricted(
         for m in succeeded_msgs:
             res = await distribute_video(
                 src_client, m, source_id, s_title, prof_key,
-                send_notification=False, target_ids_override=bot_only_targets, defer_save=True
+                send_notification=False, target_ids_override=bot_only_targets, defer_save=True, flood_cb=flood_cb
             )
             if res:
                 bot_delivered += 1
@@ -1642,7 +1756,19 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
     cur_expected = 0
     last_edit = 0.0
     unsaved_ops = 0
+    last_cooldown_at = 0
     state_lock = asyncio.Lock()
+
+    async def sync_flood_cb(secs: int):
+        await wait_out_flood(
+            acc_id,
+            secs,
+            reply_chat_id=reply_chat_id,
+            status_msg_id=status_msg_id,
+            prof_key=prof_key,
+            copied=copied,
+            should_stop_fn=lambda: bool(sync_state["should_stop"]),
+        )
 
     async def maybe_update_progress(current_title: str, mode_label: str, force: bool = False):
         nonlocal last_edit
@@ -1670,8 +1796,24 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
         except Exception:
             pass
 
+    async def maybe_cooldown_pause(current_title: str):
+        nonlocal last_cooldown_at
+        if copied - last_cooldown_at >= 400 and not sync_state["should_stop"]:
+            last_cooldown_at = copied
+            await maybe_update_progress(current_title, "রেট-সেফ বিরতি (১০ সে.)", force=True)
+            for _ in range(5):
+                if sync_state["should_stop"]:
+                    return
+                await asyncio.sleep(2.0)
+
     was_cancelled = False
     try:
+        # Immediately surface remaining FloodWait cooldown if account is already rate-limited!
+        if acc_id:
+            pre_rem = int(account_flood_until.get(acc_id, 0.0) - time.time())
+            if pre_rem > 3:
+                await sync_flood_cb(pre_rem)
+
         for sid in source_ids:
             if sync_state["should_stop"] or (limit_count and copied >= limit_count):
                 break
@@ -1740,7 +1882,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
 
                     msg_iter = dedup_msg_iter()
 
-                    # Stage A (Unrestricted sources): Instant 20x Cloud Batch Forward via ForwardMessagesRequest
+                    # Stage A (Unrestricted sources): Safe Paced Batch Direct Forward via ForwardMessagesRequest
                     if src_canon not in restricted_source_chats:
                         batch = []
                         async for msg in msg_iter:
@@ -1767,7 +1909,10 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                             _, (sw, sh) = build_video_attributes(msg, None)
                             is_broken = is_video_message(msg) and getattr(msg, "document", None) and (sw <= 16 or sh <= 16)
                             if is_broken:
-                                res = await distribute_video(src_client, msg, sid, s_title, prof_key, send_notification=False, defer_save=True)
+                                res = await distribute_video(
+                                    src_client, msg, sid, s_title, prof_key,
+                                    send_notification=False, defer_save=True, flood_cb=sync_flood_cb
+                                )
                                 if res:
                                     copied += 1
                                     unsaved_ops += 1
@@ -1780,7 +1925,8 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                             max_batch = min(BULK_BATCH_SIZE, limit_count - copied) if limit_count else BULK_BATCH_SIZE
                             if len(batch) >= max(1, max_batch):
                                 ok_n, rej = await _batch_forward_unrestricted(
-                                    src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
+                                    src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids,
+                                    flood_cb=sync_flood_cb, should_stop_fn=lambda: bool(sync_state["should_stop"])
                                 )
                                 batch = []
                                 if ok_n:
@@ -1793,6 +1939,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                                     save_state()
                                     unsaved_ops = 0
                                 await maybe_update_progress(s_title, "ডিরেক্ট ফরোয়ার্ড")
+                                await maybe_cooldown_pause(s_title)
                                 if src_canon in restricted_source_chats:
                                     break
 
@@ -1801,7 +1948,8 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
 
                         if batch and not sync_state["should_stop"] and (not limit_count or copied < limit_count):
                             ok_n, rej = await _batch_forward_unrestricted(
-                                src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
+                                src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids,
+                                flood_cb=sync_flood_cb, should_stop_fn=lambda: bool(sync_state["should_stop"])
                             )
                             if ok_n:
                                 copied += ok_n
@@ -1821,7 +1969,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                     logger.info(f"🚀 [{prof_key}] Running Turbo Prefetch Pipeline on: {s_title} ({pass_name}, seeds={len(fallback_seed_msgs)}, stream={drain_remaining_iter})")
                     prefetch_q: asyncio.Queue = asyncio.Queue(maxsize=4)
                     dl_sem = asyncio.Semaphore(2)
-                    created_tasks: list[asyncio.Task] = []
+                    active_tasks: set[asyncio.Task] = set()
                     num_upload_workers = 2
 
                     async def _prefetch_job(m):
@@ -1830,6 +1978,12 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                                 return None
                             return await prepare_video_payload(src_client, m, src_canon, source_peer=sid)
 
+                    def _spawn_prefetch(m):
+                        t = asyncio.create_task(_prefetch_job(m))
+                        active_tasks.add(t)
+                        t.add_done_callback(active_tasks.discard)
+                        return t
+
                     async def _producer():
                         nonlocal scanned, skipped_dup, skipped_other
                         enqueued = 0
@@ -1837,8 +1991,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                             for seed_m in fallback_seed_msgs:
                                 if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
                                     break
-                                t = asyncio.create_task(_prefetch_job(seed_m))
-                                created_tasks.append(t)
+                                t = _spawn_prefetch(seed_m)
                                 await prefetch_q.put((seed_m, t))
                                 enqueued += 1
 
@@ -1861,8 +2014,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                                             continue
                                         seen_set.add(fp)
 
-                                    t = asyncio.create_task(_prefetch_job(msg))
-                                    created_tasks.append(t)
+                                    t = _spawn_prefetch(msg)
                                     await prefetch_q.put((msg, t))
                                     enqueued += 1
                         except asyncio.CancelledError:
@@ -1900,9 +2052,9 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
 
                                 res = await distribute_video(
                                     src_client, m, sid, s_title, prof_key,
-                                    send_notification=False, preloaded=payload, defer_save=True
+                                    send_notification=False, preloaded=payload, defer_save=True, flood_cb=sync_flood_cb
                                 )
-                                payload = None  # distribute_video already cleaned up payload
+                                payload = None
                                 async with state_lock:
                                     if res:
                                         copied += 1
@@ -1928,14 +2080,9 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                             if not w.done():
                                 w.cancel()
                         await asyncio.gather(prod_task, *workers, return_exceptions=True)
-                        for t in created_tasks:
+                        for t in list(active_tasks):
                             if not t.done():
                                 t.cancel()
-                            elif not t.cancelled():
-                                try:
-                                    _cleanup_payload(t.result())
-                                except Exception:
-                                    pass
                         while not prefetch_q.empty():
                             left = prefetch_q.get_nowait()
                             if left and isinstance(left, tuple):
