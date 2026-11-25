@@ -67,7 +67,7 @@ from config import (
     BASE_DIR,
     LOG_FORMAT,
 )
-from utils import format_size, is_video_message, clean_chat_input, parse_telegram_link
+from utils import format_size, is_video_message, is_sticker_message, clean_chat_input, parse_telegram_link
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("MultiForwarder")
@@ -318,15 +318,18 @@ def get_active_sync(prof_key: str) -> dict:
 # ==================== MEDIA FILTER & FINGERPRINT ====================
 
 def is_eligible_media(message, profile: dict) -> bool:
-    if not message or not message.media:
+    if not message or not getattr(message, "media", None):
+        return False
+    # Always skip Telegram stickers (.webm / .tgs / .webp / custom emoji) in ALL modes
+    if is_sticker_message(message):
         return False
     m_filter = profile.get("media_filter", "video_only")
     if m_filter == "all_media":
         return True
-    # Filter tiny animated reaction GIFs (<300 KB) even if mime is video/mp4
+    # Filter reaction GIFs / tiny silent animated loops (<500 KB) when video_only
     if getattr(message, "gif", None):
         fsize = getattr(message.file, "size", 0) if message.file else 0
-        if fsize and fsize < 300_000:
+        if fsize and fsize < 500_000:
             return False
     return is_video_message(message)
 
@@ -671,7 +674,7 @@ async def resolve_profile_key_from_chat(event) -> tuple[str, int | None]:
 # ==================== SMART HYBRID VIDEO FORWARDING ENGINE ====================
 
 FAST_CHUNK_SIZE = 512 * 1024  # 512 KB (maximum Telegram MTProto chunk size)
-TRANSFER_CONCURRENCY = 8      # Concurrent pipelined chunk requests per file
+TRANSFER_CONCURRENCY = 4      # Balanced 4x512KB=2MB pipeline per file (prevents DC4 timeouts)
 BULK_BATCH_SIZE = 20          # Unrestricted cloud-forward batch size per RPC
 
 def _record_fingerprint_and_count(profile: dict, fp: str, count: int = 1, defer_save: bool = False):
@@ -680,8 +683,8 @@ def _record_fingerprint_and_count(profile: dict, fp: str, count: int = 1, defer_
         seen_list = profile.get("seen_fingerprints", [])
         if fp not in seen_list:
             seen_list.append(fp)
-            if len(seen_list) > 6000:
-                seen_list = seen_list[-5000:]
+            if len(seen_list) > 25000:
+                seen_list = seen_list[-20000:]
             profile["seen_fingerprints"] = seen_list
     profile["forwarded_count"] = profile.get("forwarded_count", 0) + count
     if not defer_save:
@@ -698,10 +701,16 @@ def _cleanup_payload(payload: dict | None):
         except Exception:
             pass
 
-async def fast_download_video(client: TelegramClient, message, dest_path: Path, concurrency: int = TRANSFER_CONCURRENCY) -> Path | None:
+async def fast_download_video(
+    client: TelegramClient,
+    message,
+    dest_path: Path,
+    concurrency: int = TRANSFER_CONCURRENCY,
+    source_peer=None,
+) -> Path | None:
     """
-    Pipelined 512 KB chunk downloader directly streaming to disk (~3x-8x faster than download_media, <5 MB RAM).
-    Automatically falls back to Telethon download_media for non-document/small/CDN media.
+    Pipelined 512 KB chunk downloader directly streaming to disk (<4 MB RAM).
+    Automatically handles cross-DC borrowing, file_reference refresh & resilient retries.
     """
     doc = getattr(message, "document", None)
     file_size = getattr(doc, "size", 0) if doc else 0
@@ -715,17 +724,31 @@ async def fast_download_video(client: TelegramClient, message, dest_path: Path, 
     sem = asyncio.Semaphore(concurrency)
     offsets = list(range(0, file_size, FAST_CHUNK_SIZE))
     fh = None
+    ref_target = source_peer or getattr(message, "chat_id", None) or getattr(message, "peer_id", None)
+
+    async def ensure_sender(force_reborrow: bool = False):
+        async with state_lock:
+            if force_reborrow and state["exported"] and state["sender"]:
+                try:
+                    await client._return_exported_sender(state["sender"])
+                except Exception:
+                    pass
+                state["sender"] = None
+                state["exported"] = False
+            if state["dc_id"] and state["dc_id"] != client.session.dc_id:
+                if state["sender"] is None or (hasattr(state["sender"], "is_connected") and not state["sender"].is_connected()):
+                    try:
+                        state["sender"] = await client._borrow_exported_sender(state["dc_id"])
+                        state["exported"] = True
+                    except tl_errors.DcIdInvalidError:
+                        state["sender"] = client._sender
+                        state["exported"] = False
+            else:
+                state["sender"] = client._sender
+                state["exported"] = False
 
     try:
-        if state["dc_id"] and state["dc_id"] != client.session.dc_id:
-            try:
-                state["sender"] = await client._borrow_exported_sender(state["dc_id"])
-                state["exported"] = True
-            except tl_errors.DcIdInvalidError:
-                state["sender"] = client._sender
-        else:
-            state["sender"] = client._sender
-
+        await ensure_sender()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(dest_path, "wb+")
         fh.truncate(file_size)
@@ -734,6 +757,8 @@ async def fast_download_video(client: TelegramClient, message, dest_path: Path, 
             async with sem:
                 for attempt in range(4):
                     try:
+                        if state["sender"] is None or (hasattr(state["sender"], "is_connected") and not state["sender"].is_connected()):
+                            await ensure_sender(force_reborrow=True)
                         req = functions.upload.GetFileRequest(loc, offset=off, limit=FAST_CHUNK_SIZE)
                         res = await client._call(state["sender"], req)
                         if isinstance(res, types.upload.FileCdnRedirect):
@@ -743,8 +768,10 @@ async def fast_download_video(client: TelegramClient, message, dest_path: Path, 
                         fh.write(data)
                         return
                     except (tl_errors.FileReferenceExpiredError, tl_errors.FilerefUpgradeNeededError):
+                        if not ref_target:
+                            raise
                         async with state_lock:
-                            fresh = await client.get_messages(message.chat_id, ids=message.id)
+                            fresh = await client.get_messages(ref_target, ids=message.id)
                             if fresh and getattr(fresh, "document", None):
                                 loc.file_reference = fresh.document.file_reference
                             else:
@@ -764,10 +791,12 @@ async def fast_download_video(client: TelegramClient, message, dest_path: Path, 
                         wait_s = min(fl.seconds + 1, 60)
                         logger.warning(f"Download FloodWait ({fl.seconds}s) -> sleeping {wait_s}s")
                         await asyncio.sleep(wait_s)
-                    except (asyncio.TimeoutError, tl_errors.TimedOutError, ConnectionError):
+                    except (asyncio.TimeoutError, tl_errors.TimedOutError, ConnectionError, OSError, ValueError) as net_err:
                         if attempt == 3:
                             raise
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1.0 + attempt)
+                        if state["exported"]:
+                            await ensure_sender(force_reborrow=True)
 
         await asyncio.gather(*(fetch_chunk(off) for off in offsets))
         fh.flush()
@@ -777,7 +806,7 @@ async def fast_download_video(client: TelegramClient, message, dest_path: Path, 
             return dest_path
         raise RuntimeError(f"Incomplete size {dest_path.stat().st_size if dest_path.exists() else 0} != {file_size}")
     except Exception as e:
-        logger.debug(f"fast_download_video fallback ({e})")
+        logger.warning(f"fast_download_video fallback (msg={message.id}, dc={getattr(doc, 'dc_id', None)}): {e}")
         try:
             if fh is not None:
                 fh.close()
@@ -785,8 +814,28 @@ async def fast_download_video(client: TelegramClient, message, dest_path: Path, 
             dest_path.unlink(missing_ok=True)
         except Exception:
             pass
-        dl = await client.download_media(message, file=str(dest_path))
-        return Path(dl) if dl and os.path.exists(dl) else None
+        cur_msg = message
+        for dl_try in range(2):
+            try:
+                dl = await client.download_media(cur_msg, file=str(dest_path))
+                if dl and os.path.exists(dl):
+                    return Path(dl)
+            except (tl_errors.FileReferenceExpiredError, tl_errors.FilerefUpgradeNeededError):
+                if ref_target:
+                    fresh = await client.get_messages(ref_target, ids=message.id)
+                    if fresh:
+                        cur_msg = fresh
+                        continue
+            except Exception as fb_err:
+                logger.warning(f"Fallback download retry {dl_try + 1} failed for msg {message.id}: {fb_err}")
+                if dl_try == 0:
+                    await asyncio.sleep(3)
+                    if ref_target:
+                        try:
+                            cur_msg = await client.get_messages(ref_target, ids=message.id) or cur_msg
+                        except Exception:
+                            pass
+        return None
     finally:
         if fh is not None:
             try:
@@ -900,7 +949,7 @@ async def upload_file_with_retry(
                 raise
     return None
 
-async def prepare_video_payload(source_client: TelegramClient, message, src_canon: int) -> dict | None:
+async def prepare_video_payload(source_client: TelegramClient, message, src_canon: int, source_peer=None) -> dict | None:
     """Downloads video (512KB pipelined) + optional thumb concurrently and extracts native frame attributes."""
     ext = (getattr(message.file, "ext", None) or ".mp4") if message.file else ".mp4"
     uid_tag = helpers.generate_random_long() & 0xFFFF
@@ -922,7 +971,7 @@ async def prepare_video_payload(source_client: TelegramClient, message, src_cano
             return None
 
     dl_res, thumb_res = await asyncio.gather(
-        fast_download_video(source_client, message, temp_video_path),
+        fast_download_video(source_client, message, temp_video_path, source_peer=source_peer),
         dl_thumb(),
     )
     if not dl_res or not Path(dl_res).exists():
@@ -1014,7 +1063,7 @@ async def distribute_video(
         async with dl_lock:
             if payload is None:
                 logger.info(f"📥 Fast downloading ({format_size(file_size)})...")
-                payload = await prepare_video_payload(source_client, message, src_canon)
+                payload = await prepare_video_payload(source_client, message, src_canon, source_peer=source_chat_id)
         return payload
 
     async def send_to_single_target(tgt_id: int, allow_cloud_probe: bool = True) -> str | None:
@@ -1212,7 +1261,13 @@ async def run_client_forever(client: TelegramClient, label: str):
             logger.warning(f"⚠️ {label} disconnected cleanly. Reconnecting in {backoff}s...")
         except asyncio.CancelledError:
             break
+        except (tl_errors.AuthKeyDuplicatedError, tl_errors.AuthKeyUnregisteredError) as fatal_auth:
+            logger.error(f"❌ {label} session invalidated ({type(fatal_auth).__name__}). Reconnect via /login QR.")
+            break
         except Exception as e:
+            if "authkeyduplicated" in str(e).lower():
+                logger.error(f"❌ {label} session duplicated/invalidated. Reconnect via /login QR.")
+                break
             logger.error(f"⚠️ {label} connection error ({e}). Reconnecting in {backoff}s...")
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60)
@@ -1243,9 +1298,113 @@ async def start_user_account(session_str: str, phone: str = "") -> tuple[int, Te
 
 # ==================== TURBO BULK SYNC WORKER ====================
 
+async def resilient_iter_messages(
+    client: TelegramClient,
+    entity,
+    *,
+    filter_obj=None,
+    server_total: int = 0,
+    should_stop_fn=None,
+    label: str = "",
+):
+    """
+    Iterates ALL matching messages safely across 10,000-100,000+ message channels:
+    - Retries transient FloodWait / Timeout / Connection / Server errors resuming from exact offset_id
+    - Recovers via reverse=False if Telegram reverse=True stops early on cleared-history holes
+    """
+    seen_msg_ids: set[int] = set()
+    last_id = 0
+    retries = 0
+
+    while retries < 8:
+        if should_stop_fn and should_stop_fn():
+            return
+        try:
+            it = client.iter_messages(
+                entity,
+                limit=None,
+                offset_id=last_id,
+                filter=filter_obj,
+                reverse=True,
+                wait_time=0.25,
+            )
+            async for msg in it:
+                if should_stop_fn and should_stop_fn():
+                    return
+                if not msg or msg.id in seen_msg_ids:
+                    continue
+                seen_msg_ids.add(msg.id)
+                if msg.id > last_id:
+                    last_id = msg.id
+                yield msg
+            break
+        except FloodWaitError as fl:
+            wait_s = min(fl.seconds + 2, 120)
+            logger.warning(f"History scan FloodWait ({fl.seconds}s) on {label} at id={last_id}: sleeping {wait_s}s...")
+            await asyncio.sleep(wait_s)
+            retries += 1
+        except (
+            asyncio.TimeoutError,
+            tl_errors.TimedOutError,
+            tl_errors.ServerError,
+            tl_errors.RpcCallFailError,
+            ConnectionError,
+            OSError,
+            ValueError,
+        ) as net_e:
+            retries += 1
+            wait_s = min(4 * retries, 30)
+            logger.warning(f"History scan interrupted on {label} at id={last_id} ({net_e}); retry {retries}/8 in {wait_s}s...")
+            await asyncio.sleep(wait_s)
+
+    if (not should_stop_fn or not should_stop_fn()) and server_total >= 40 and len(seen_msg_ids) < int(server_total * 0.85):
+        logger.info(f"🔄 [{label}] Reverse scan reached {len(seen_msg_ids)}/{server_total}; recovering rest via descending pass")
+        desc_offset = 0
+        retries = 0
+        while retries < 8:
+            if should_stop_fn and should_stop_fn():
+                return
+            try:
+                it_desc = client.iter_messages(
+                    entity,
+                    limit=None,
+                    offset_id=desc_offset,
+                    filter=filter_obj,
+                    reverse=False,
+                    wait_time=0.25,
+                )
+                async for msg in it_desc:
+                    if should_stop_fn and should_stop_fn():
+                        return
+                    if not msg:
+                        continue
+                    if desc_offset == 0 or msg.id < desc_offset:
+                        desc_offset = msg.id
+                    if msg.id in seen_msg_ids:
+                        continue
+                    seen_msg_ids.add(msg.id)
+                    yield msg
+                break
+            except FloodWaitError as fl:
+                wait_s = min(fl.seconds + 2, 120)
+                await asyncio.sleep(wait_s)
+                retries += 1
+            except (
+                asyncio.TimeoutError,
+                tl_errors.TimedOutError,
+                tl_errors.ServerError,
+                tl_errors.RpcCallFailError,
+                ConnectionError,
+                OSError,
+                ValueError,
+            ):
+                retries += 1
+                await asyncio.sleep(min(4 * retries, 30))
+
 async def _batch_forward_unrestricted(
     src_client: TelegramClient,
     s_entity,
+    source_id: int,
     src_canon: int,
     s_title: str,
     batch: list,
@@ -1315,7 +1474,7 @@ async def _batch_forward_unrestricted(
     if bot_only_targets:
         for m in batch:
             res = await distribute_video(
-                src_client, m, src_canon, s_title, prof_key,
+                src_client, m, source_id, s_title, prof_key,
                 send_notification=False, target_ids_override=bot_only_targets, defer_save=True
             )
             if res:
@@ -1361,6 +1520,10 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
 
     copied = 0
     scanned = 0
+    skipped_dup = 0
+    skipped_other = 0
+    failed = 0
+    cur_expected = 0
     last_edit = 0.0
     unsaved_ops = 0
 
@@ -1370,14 +1533,16 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
         if not force and (now - last_edit < 4.0):
             return
         last_edit = now
+        exp_txt = f" (মোট ভিডিও: ~<code>{cur_expected}</code>)" if cur_expected > 0 else ""
         try:
             await bot_client.edit_message(
                 reply_chat_id,
                 status_msg_id,
                 f"⚡ <b>মাল্টি-সিঙ্ক চলছে ({mode_label})...</b>\n\n"
                 f"📥 সোর্স: <code>{len(source_ids)}</code> টি | 📤 টার্গেট: <code>{len(target_ids)}</code> টি\n"
-                f"🎬 বর্তমান চ্যাট: <b>{h(current_title)}</b>\n"
-                f"🔎 স্ক্যান: <code>{scanned}</code> টি | ✅ ফরোয়ার্ড: <code>{copied}</code> টি ভিডিও\n\n"
+                f"🎬 বর্তমান চ্যাট: <b>{h(current_title)}</b>{exp_txt}\n"
+                f"🔎 স্ক্যান: <code>{scanned}</code> | ✅ ফরোয়ার্ড: <code>{copied}</code> টি\n"
+                f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/GIF বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n\n"
                 f"🚀 <i>টার্বো পাইপলাইন সক্রিয়...</i>",
                 buttons=[[Button.inline("🛑 সিঙ্ক থামান (Stop)", f"stop:{prof_key}".encode())]]
             )
@@ -1391,212 +1556,252 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
             if sync_state["should_stop"] or (limit_count and copied >= limit_count):
                 break
 
-            s_entity = await get_entity_safe(src_client, sid, f"u_{acc_id}")
-            if not s_entity:
-                continue
+            try:
+                s_entity = await get_entity_safe(src_client, sid, f"u_{acc_id}")
+                if not s_entity:
+                    continue
 
-            src_canon = to_canonical_id(sid)
-            s_title = profile.get("source_titles", {}).get(str(sid), getattr(s_entity, "title", str(sid)))
-            if getattr(s_entity, "noforwards", False):
-                restricted_source_chats.add(src_canon)
+                src_canon = to_canonical_id(sid)
+                s_title = profile.get("source_titles", {}).get(str(sid), getattr(s_entity, "title", str(sid)))
+                if getattr(s_entity, "noforwards", False):
+                    restricted_source_chats.add(src_canon)
 
-            dup_on = profile.get("duplicate_protection", True)
-            seen_set = set(profile.get("seen_fingerprints", [])) if dup_on else set()
+                # Probe Telegram server video index when video_only mode is active
+                filter_obj = None
+                cur_expected = 0
+                if profile.get("media_filter", "video_only") == "video_only":
+                    try:
+                        vid_probe = await src_client.get_messages(s_entity, limit=1, filter=types.InputMessagesFilterVideo)
+                        vid_tot = getattr(vid_probe, "total", 0) or len(vid_probe)
+                        if vid_tot > 0:
+                            filter_obj = types.InputMessagesFilterVideo
+                            cur_expected = vid_tot
+                    except Exception:
+                        pass
 
-            # Stage A (Unrestricted sources): Instant 20x Cloud Batch Forward via ForwardMessagesRequest
-            fallback_seed_msgs = []
-            msg_iter = src_client.iter_messages(s_entity, limit=None, reverse=True)
+                dup_on = profile.get("duplicate_protection", True)
+                seen_set = set(profile.get("seen_fingerprints", [])) if dup_on else set()
+                logger.info(f"📂 [{prof_key}] Scanning source '{s_title}' ({sid}) | expected_videos={cur_expected or 'all'} | filter={'VideoIndex' if filter_obj else 'FullHistory'}")
 
-            if src_canon not in restricted_source_chats:
-                batch = []
-                async for msg in msg_iter:
-                    if sync_state["should_stop"] or (limit_count and copied >= limit_count):
-                        break
-                    scanned += 1
-                    sync_state["scanned"] = scanned
+                fallback_seed_msgs = []
+                msg_iter = resilient_iter_messages(
+                    src_client,
+                    s_entity,
+                    filter_obj=filter_obj,
+                    server_total=cur_expected,
+                    should_stop_fn=lambda: bool(sync_state["should_stop"] or (limit_count and copied >= limit_count)),
+                    label=s_title,
+                )
 
-                    if not is_eligible_media(msg, profile):
-                        if scanned % 60 == 0:
-                            await maybe_update_progress(s_title, "ব্যাচ স্ক্যান")
-                        continue
+                # Stage A (Unrestricted sources): Instant 20x Cloud Batch Forward via ForwardMessagesRequest
+                if src_canon not in restricted_source_chats:
+                    batch = []
+                    async for msg in msg_iter:
+                        if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                            break
+                        scanned += 1
+                        sync_state["scanned"] = scanned
 
-                    fp = get_media_fingerprint(msg)
-                    if dup_on and fp:
-                        if fp in seen_set:
+                        if not is_eligible_media(msg, profile):
+                            skipped_other += 1
+                            if scanned % 80 == 0:
+                                await maybe_update_progress(s_title, "ব্যাচ স্ক্যান")
                             continue
-                        seen_set.add(fp)
 
-                    _, (sw, sh) = build_video_attributes(msg, None)
-                    is_broken = is_video_message(msg) and getattr(msg, "document", None) and (sw <= 16 or sh <= 16)
-                    if is_broken:
-                        res = await distribute_video(src_client, msg, sid, s_title, prof_key, send_notification=False, defer_save=True)
-                        if res:
-                            copied += 1
-                            unsaved_ops += 1
-                            sync_state["copied"] = copied
-                    else:
-                        batch.append(msg)
+                        fp = get_media_fingerprint(msg)
+                        if dup_on and fp:
+                            if fp in seen_set:
+                                skipped_dup += 1
+                                if skipped_dup % 100 == 0:
+                                    await maybe_update_progress(s_title, "ব্যাচ স্ক্যান")
+                                continue
+                            seen_set.add(fp)
 
-                    max_batch = min(BULK_BATCH_SIZE, limit_count - copied) if limit_count else BULK_BATCH_SIZE
-                    if len(batch) >= max(1, max_batch):
+                        _, (sw, sh) = build_video_attributes(msg, None)
+                        is_broken = is_video_message(msg) and getattr(msg, "document", None) and (sw <= 16 or sh <= 16)
+                        if is_broken:
+                            res = await distribute_video(src_client, msg, sid, s_title, prof_key, send_notification=False, defer_save=True)
+                            if res:
+                                copied += 1
+                                unsaved_ops += 1
+                                sync_state["copied"] = copied
+                            else:
+                                failed += 1
+                        else:
+                            batch.append(msg)
+
+                        max_batch = min(BULK_BATCH_SIZE, limit_count - copied) if limit_count else BULK_BATCH_SIZE
+                        if len(batch) >= max(1, max_batch):
+                            ok_n, rej = await _batch_forward_unrestricted(
+                                src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
+                            )
+                            batch = []
+                            if ok_n:
+                                copied += ok_n
+                                unsaved_ops += ok_n
+                                sync_state["copied"] = copied
+                            if rej:
+                                fallback_seed_msgs.extend(rej)
+                            if unsaved_ops >= 15:
+                                save_state()
+                                unsaved_ops = 0
+                            await maybe_update_progress(s_title, "সুপার-ফাস্ট ব্যাচ")
+                            if src_canon in restricted_source_chats:
+                                break
+
+                        if limit_count and copied >= limit_count:
+                            break
+
+                    if batch and not sync_state["should_stop"] and (not limit_count or copied < limit_count):
                         ok_n, rej = await _batch_forward_unrestricted(
-                            src_client, s_entity, src_canon, s_title, batch, profile, prof_key, target_ids
+                            src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
                         )
-                        batch = []
                         if ok_n:
                             copied += ok_n
                             unsaved_ops += ok_n
                             sync_state["copied"] = copied
                         if rej:
                             fallback_seed_msgs.extend(rej)
-                        if unsaved_ops >= 15:
-                            save_state()
-                            unsaved_ops = 0
-                        await maybe_update_progress(s_title, "সুপার-ফাস্ট ব্যাচ")
-                        if src_canon in restricted_source_chats:
-                            break
 
-                    if limit_count and copied >= limit_count:
-                        break
-
-                if batch and not sync_state["should_stop"] and (not limit_count or copied < limit_count):
-                    ok_n, rej = await _batch_forward_unrestricted(
-                        src_client, s_entity, src_canon, s_title, batch, profile, prof_key, target_ids
-                    )
-                    if ok_n:
-                        copied += ok_n
-                        unsaved_ops += ok_n
-                        sync_state["copied"] = copied
-                    if rej:
-                        fallback_seed_msgs.extend(rej)
-
-                # If source wasn't restricted, we already drained all messages cleanly!
-                if src_canon not in restricted_source_chats:
+                drain_remaining_iter = (src_canon in restricted_source_chats)
+                if not drain_remaining_iter and not fallback_seed_msgs:
                     continue
 
-            # Stage B (Restricted/Protected sources): 2x Background Prefetch + 8x512KB Turbo Transfer Pipeline
-            if sync_state["should_stop"] or (limit_count and copied >= limit_count):
-                continue
+                # Stage B (Restricted/Protected or fallback items): 2x Background Prefetch + 512KB Turbo Transfer Pipeline
+                if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                    continue
 
-            logger.info(f"🚀 [{prof_key}] Running Turbo Prefetch Pipeline on protected source: {s_title}")
-            prefetch_q: asyncio.Queue = asyncio.Queue(maxsize=3)
-            dl_sem = asyncio.Semaphore(2)
-            created_tasks: list[asyncio.Task] = []
+                logger.info(f"🚀 [{prof_key}] Running Turbo Prefetch Pipeline on source: {s_title} (seeds={len(fallback_seed_msgs)}, stream_rest={drain_remaining_iter})")
+                prefetch_q: asyncio.Queue = asyncio.Queue(maxsize=3)
+                dl_sem = asyncio.Semaphore(2)
+                created_tasks: list[asyncio.Task] = []
 
-            async def _prefetch_job(m):
-                async with dl_sem:
-                    if sync_state["should_stop"]:
-                        return None
-                    return await prepare_video_payload(src_client, m, src_canon)
+                async def _prefetch_job(m):
+                    async with dl_sem:
+                        if sync_state["should_stop"]:
+                            return None
+                        return await prepare_video_payload(src_client, m, src_canon, source_peer=sid)
 
-            async def _producer():
-                nonlocal scanned
-                enqueued = 0
-                try:
-                    for seed_m in fallback_seed_msgs:
-                        if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
-                            break
-                        t = asyncio.create_task(_prefetch_job(seed_m))
-                        created_tasks.append(t)
-                        await prefetch_q.put((seed_m, t))
-                        enqueued += 1
-
-                    async for msg in msg_iter:
-                        if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
-                            break
-                        scanned += 1
-                        sync_state["scanned"] = scanned
-
-                        if not is_eligible_media(msg, profile):
-                            continue
-                        fp = get_media_fingerprint(msg)
-                        if fp and fp in seen_set:
-                            continue
-                        if fp:
-                            seen_set.add(fp)
-
-                        t = asyncio.create_task(_prefetch_job(msg))
-                        created_tasks.append(t)
-                        await prefetch_q.put((msg, t))
-                        enqueued += 1
-                except asyncio.CancelledError:
-                    raise
-                except Exception as pe:
-                    logger.error(f"Prefetch producer error on {s_title}: {pe}")
-                finally:
-                    await prefetch_q.put(None)
-
-            prod_task = asyncio.create_task(_producer())
-            try:
-                while True:
-                    item = await prefetch_q.get()
-                    if item is None:
-                        break
-                    m, dl_task = item
-                    if sync_state["should_stop"] or (limit_count and copied >= limit_count):
-                        dl_task.cancel()
-                        continue
-                    payload = None
+                async def _producer():
+                    nonlocal scanned, skipped_dup, skipped_other
+                    enqueued = 0
                     try:
-                        payload = await dl_task
+                        for seed_m in fallback_seed_msgs:
+                            if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
+                                break
+                            t = asyncio.create_task(_prefetch_job(seed_m))
+                            created_tasks.append(t)
+                            await prefetch_q.put((seed_m, t))
+                            enqueued += 1
+
+                        if drain_remaining_iter:
+                            async for msg in msg_iter:
+                                if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
+                                    break
+                                scanned += 1
+                                sync_state["scanned"] = scanned
+
+                                if not is_eligible_media(msg, profile):
+                                    skipped_other += 1
+                                    continue
+                                fp = get_media_fingerprint(msg)
+                                if dup_on and fp:
+                                    if fp in seen_set:
+                                        skipped_dup += 1
+                                        if skipped_dup % 100 == 0:
+                                            await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
+                                        continue
+                                    seen_set.add(fp)
+
+                                t = asyncio.create_task(_prefetch_job(msg))
+                                created_tasks.append(t)
+                                await prefetch_q.put((msg, t))
+                                enqueued += 1
                     except asyncio.CancelledError:
-                        continue
-                    except Exception as dl_ex:
-                        logger.warning(f"Prefetch task failed for msg {m.id}: {dl_ex}")
-                        payload = None
+                        raise
+                    except Exception as pe:
+                        logger.error(f"Prefetch producer error on {s_title}: {pe}")
+                    finally:
+                        await prefetch_q.put(None)
 
-                    if sync_state["should_stop"]:
-                        _cleanup_payload(payload)
-                        break
-
-                    res = await distribute_video(
-                        src_client, m, sid, s_title, prof_key,
-                        send_notification=False, preloaded=payload, defer_save=True
-                    )
-                    if res:
-                        copied += 1
-                        unsaved_ops += 1
-                        sync_state["copied"] = copied
-                        if unsaved_ops >= 10:
-                            save_state()
-                            unsaved_ops = 0
-                        await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
-
-                    if limit_count and copied >= limit_count:
-                        break
-            finally:
-                prod_task.cancel()
+                prod_task = asyncio.create_task(_producer())
                 try:
-                    await prod_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                for t in created_tasks:
-                    if not t.done():
-                        t.cancel()
-                    elif not t.cancelled():
+                    while True:
+                        item = await prefetch_q.get()
+                        if item is None:
+                            break
+                        m, dl_task = item
+                        if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                            dl_task.cancel()
+                            continue
+                        payload = None
                         try:
-                            _cleanup_payload(t.result())
-                        except Exception:
-                            pass
-                while not prefetch_q.empty():
-                    left = prefetch_q.get_nowait()
-                    if left and isinstance(left, tuple):
-                        _, lt = left
-                        if not lt.done():
-                            lt.cancel()
-                        elif not lt.cancelled():
+                            payload = await dl_task
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception as dl_ex:
+                            logger.warning(f"Prefetch task failed for msg {m.id}: {dl_ex}")
+                            payload = None
+
+                        if sync_state["should_stop"]:
+                            _cleanup_payload(payload)
+                            break
+
+                        res = await distribute_video(
+                            src_client, m, sid, s_title, prof_key,
+                            send_notification=False, preloaded=payload, defer_save=True
+                        )
+                        if res:
+                            copied += 1
+                            unsaved_ops += 1
+                            sync_state["copied"] = copied
+                            if unsaved_ops >= 10:
+                                save_state()
+                                unsaved_ops = 0
+                            await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
+                        else:
+                            failed += 1
+                            await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
+
+                        if limit_count and copied >= limit_count:
+                            break
+                finally:
+                    prod_task.cancel()
+                    try:
+                        await prod_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    for t in created_tasks:
+                        if not t.done():
+                            t.cancel()
+                        elif not t.cancelled():
                             try:
-                                _cleanup_payload(lt.result())
+                                _cleanup_payload(t.result())
                             except Exception:
                                 pass
+                    while not prefetch_q.empty():
+                        left = prefetch_q.get_nowait()
+                        if left and isinstance(left, tuple):
+                            _, lt = left
+                            if not lt.done():
+                                lt.cancel()
+                            elif not lt.cancelled():
+                                try:
+                                    _cleanup_payload(lt.result())
+                                except Exception:
+                                    pass
+            except Exception as src_err:
+                logger.error(f"Source sync error on {sid} ({prof_key}): {src_err}")
+                failed += 1
+                continue
 
         status_hdr = "🛑 <b>সিঙ্ক বন্ধ করা হয়েছে!</b>" if sync_state["should_stop"] else "🎉 <b>মাল্টি-সিঙ্ক সফলভাবে সম্পন্ন হয়েছে!</b>"
         await bot_client.edit_message(
             reply_chat_id,
             status_msg_id,
             f"{status_hdr}\n\n"
-            f"🔎 মোট স্ক্যান: <code>{scanned}</code> টি মেসেজ\n"
-            f"✅ নতুন ফরোয়ার্ড হয়েছে: <code>{copied}</code> টি ভিডিও\n"
+            f"🔎 মোট স্ক্যান: <code>{scanned}</code> টি | ✅ ফরোয়ার্ড: <code>{copied}</code> টি\n"
+            f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/GIF বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n"
             f"📊 সর্বমোট ফরোয়ার্ড: <code>{profile.get('forwarded_count', 0)}</code> টি",
             buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]]
         )

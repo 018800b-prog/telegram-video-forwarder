@@ -83,20 +83,50 @@ def clean_chat_input(input_str: str) -> Union[int, str]:
 
     return s
 
-def is_video_message(message) -> bool:
-    if not message or not message.media:
+def is_sticker_message(message) -> bool:
+    """Detect Telegram stickers (including .webm video stickers, .tgs, .webp, custom emoji)."""
+    if not message or not getattr(message, "media", None):
         return False
-    
+    if getattr(message, "sticker", None):
+        return True
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    mime = (getattr(doc, "mime_type", "") or "").lower()
+    if mime in ("application/x-tgsticker", "image/webp"):
+        return True
+    file_size = getattr(doc, "size", 0) or 0
+    for attr in getattr(doc, "attributes", []):
+        tname = type(attr).__name__
+        if tname in ("DocumentAttributeSticker", "DocumentAttributeCustomEmoji"):
+            return True
+        fname = (getattr(attr, "file_name", "") or "").lower()
+        if fname == "sticker.webm" or fname.endswith((".tgs", ".webp")):
+            return True
+        if fname.endswith(".webm") and ("sticker" in fname or file_size < 2_000_000):
+            return True
+    if mime == "video/webm" and file_size < 2_000_000:
+        return True
+    return False
+
+def is_video_message(message) -> bool:
+    if not message or not getattr(message, "media", None):
+        return False
+    if is_sticker_message(message):
+        return False
+
     if getattr(message, "video", None):
         return True
-    
+
     if getattr(message, "document", None):
-        mime = getattr(message.document, "mime_type", "")
-        if mime and mime.startswith("video/"):
+        mime = (getattr(message.document, "mime_type", "") or "").lower()
+        if mime.startswith("video/"):
             return True
         for attr in getattr(message.document, "attributes", []):
-            file_name = getattr(attr, "file_name", "")
-            if file_name and any(file_name.lower().endswith(ext) for ext in [".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".ts"]):
+            if type(attr).__name__ == "DocumentAttributeVideo":
+                return True
+            file_name = (getattr(attr, "file_name", "") or "").lower()
+            if file_name and any(file_name.endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".3gp", ".webm"]):
                 return True
 
     return False
