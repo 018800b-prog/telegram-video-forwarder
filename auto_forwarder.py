@@ -311,9 +311,45 @@ recent_dispatched: dict[tuple[str, int, int], float] = {}
 restricted_source_chats: set[int] = set()
 
 def get_active_sync(prof_key: str) -> dict:
+    prof_key = str(prof_key)
     if prof_key not in active_syncs:
-        active_syncs[prof_key] = {"running": False, "should_stop": False, "copied": 0, "scanned": 0}
+        active_syncs[prof_key] = {
+            "running": False,
+            "should_stop": False,
+            "copied": 0,
+            "scanned": 0,
+            "task": None,
+            "chat_id": None,
+            "msg_id": None,
+        }
     return active_syncs[prof_key]
+
+def trigger_sync_stop(prof_key: str, sender_id: int | None = None, chat_id: int | None = None) -> tuple[bool, str]:
+    """Immediately signals and cancels an active bulk sync task for prof_key or matching user/chat."""
+    candidates = [str(prof_key)]
+    if sender_id is not None:
+        candidates.append(str(sender_id))
+    if chat_id is not None:
+        candidates.append(str(chat_id))
+    for k, st in list(active_syncs.items()):
+        if st.get("running") and k not in candidates:
+            candidates.append(k)
+
+    for k in candidates:
+        st = active_syncs.get(k)
+        if not st or not st.get("running"):
+            continue
+        if k != str(prof_key) and sender_id is not None:
+            prof = app_state.get("profiles", {}).get(k, {})
+            if str(prof.get("active_account_id")) != str(sender_id) and str(st.get("chat_id")) != str(chat_id):
+                continue
+        st["should_stop"] = True
+        task = st.get("task")
+        if task and not task.done():
+            task.cancel()
+        logger.info(f"🛑 Stop triggered immediately for profile [{k}] (by {sender_id})")
+        return True, k
+    return False, str(prof_key)
 
 # ==================== MEDIA FILTER & FINGERPRINT ====================
 
@@ -1088,7 +1124,7 @@ async def distribute_video(
                 except Exception as e:
                     logger.debug(f"Cloud media reuse failed on {target_title}: {e}")
 
-            # Fast path B: Direct cloud copy ONLY if source isn't restricted & video dims intact
+            # Fast path B: Direct cloud forward / copy ONLY if source isn't restricted & video dims intact
             if (
                 allow_cloud_probe
                 and payload is None
@@ -1096,31 +1132,67 @@ async def distribute_video(
                 and not source_has_broken_frame
                 and src_canon not in restricted_source_chats
             ):
+                # B1: Native ForwardMessagesRequest(drop_author=True) — fastest instant server copy
                 try:
-                    sent_msg = await upload_file_with_retry(
-                        u_client, tgt_ent, message.media,
-                        caption_text, caption_entities
-                    )
-                    if sent_msg:
-                        reusable_cloud_media = sent_msg.media
-                        reusable_cloud_client = u_client
-                        return target_title
-                except (ChatForwardsRestrictedError,) as e:
+                    src_ent = await get_entity_safe(u_client, source_chat_id, u_key)
+                    if src_ent is not None:
+                        drop_caps = profile.get("caption_mode", "original") != "original"
+                        res_upd = await u_client(functions.messages.ForwardMessagesRequest(
+                            from_peer=src_ent,
+                            id=[message.id],
+                            to_peer=tgt_ent,
+                            random_id=[helpers.generate_random_long()],
+                            drop_author=True,
+                            drop_media_captions=drop_caps,
+                        ))
+                        if res_upd:
+                            for upd in getattr(res_upd, "updates", []):
+                                m_obj = getattr(upd, "message", None)
+                                if m_obj and getattr(m_obj, "media", None):
+                                    reusable_cloud_media = m_obj.media
+                                    reusable_cloud_client = u_client
+                                    break
+                            return target_title
+                except ChatForwardsRestrictedError as e:
                     restricted_source_chats.add(src_canon)
                     logger.info(f"Source restricted ({type(e).__name__}) -> switching to turbo transfer")
                 except (ChatWriteForbiddenError, ChannelPrivateError, PeerIdInvalidError):
                     continue
-                except Exception as e:
-                    err_s = str(e).lower()
+                except FloodWaitError as fl:
+                    await asyncio.sleep(min(fl.seconds + 2, 60))
+                except Exception as fwd_e:
+                    err_s = str(fwd_e).lower()
                     if "protected chat" in err_s or "forwards" in err_s or "chat_forwards_restricted" in err_s:
                         restricted_source_chats.add(src_canon)
                         logger.info("Protected chat cached -> turbo transfer")
-                    elif "file reference" in err_s:
-                        pass
-                    elif "peer" in err_s or "write" in err_s or "admin" in err_s:
+
+                # B2: Direct SendMedia cloud copy if B1 didn't handle & source still unrestricted
+                if src_canon not in restricted_source_chats:
+                    try:
+                        sent_msg = await upload_file_with_retry(
+                            u_client, tgt_ent, message.media,
+                            caption_text, caption_entities
+                        )
+                        if sent_msg:
+                            reusable_cloud_media = sent_msg.media
+                            reusable_cloud_client = u_client
+                            return target_title
+                    except ChatForwardsRestrictedError as e:
+                        restricted_source_chats.add(src_canon)
+                        logger.info(f"Source restricted ({type(e).__name__}) -> switching to turbo transfer")
+                    except (ChatWriteForbiddenError, ChannelPrivateError, PeerIdInvalidError):
                         continue
-                    else:
-                        logger.warning(f"Direct forward error on {u_key}: {e}")
+                    except Exception as e:
+                        err_s = str(e).lower()
+                        if "protected chat" in err_s or "forwards" in err_s or "chat_forwards_restricted" in err_s:
+                            restricted_source_chats.add(src_canon)
+                            logger.info("Protected chat cached -> turbo transfer")
+                        elif "file reference" in err_s:
+                            pass
+                        elif "peer" in err_s or "write" in err_s or "admin" in err_s:
+                            continue
+                        else:
+                            logger.warning(f"Direct forward error on {u_key}: {e}")
 
             # Fallback path C: Turbo 512KB download/upload preserving native video frame
             p = await ensure_payload()
@@ -1275,8 +1347,15 @@ async def run_client_forever(client: TelegramClient, label: str):
 async def start_user_account(session_str: str, phone: str = "") -> tuple[int, TelegramClient]:
     """Boots a Userbot TelegramClient from StringSession and registers it live"""
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    await client.start()
-    me = await client.get_me()
+    try:
+        await client.start()
+        me = await client.get_me()
+    except Exception:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        raise
     uid = me.id
     full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or str(uid)
 
@@ -1414,7 +1493,8 @@ async def _batch_forward_unrestricted(
 ) -> tuple[int, list]:
     """
     Forwards up to 20 unrestricted videos per RPC via ForwardMessagesRequest(drop_author=True).
-    Returns (forwarded_item_count, fallback_messages_if_restricted).
+    Splits failed batches per-message before ever falling back to download+upload.
+    Returns (forwarded_item_count, fallback_messages_requiring_download).
     """
     valid_targets = [tid for tid in target_ids if to_canonical_id(tid) != src_canon]
     if not valid_targets or not batch:
@@ -1426,53 +1506,84 @@ async def _batch_forward_unrestricted(
 
     user_ok_targets = 0
     bot_only_targets: list[int] = []
+    fallback_msgs_by_id: dict[int, object] = {}
 
-    for tid in valid_targets:
-        tgt_ent = await get_entity_safe(src_client, tid, f"u_{acc_id}")
-        if not tgt_ent:
-            bot_only_targets.append(tid)
-            continue
-        sent_ok = False
-        for attempt in range(3):
+    async def send_forward_ids(tgt_ent, tid: int, id_list: list[int]) -> tuple[bool, bool]:
+        """Returns (success, was_restricted)."""
+        for attempt in range(5):
             try:
                 await src_client(functions.messages.ForwardMessagesRequest(
                     from_peer=s_entity,
-                    id=msg_ids,
+                    id=id_list,
                     to_peer=tgt_ent,
-                    random_id=[helpers.generate_random_long() for _ in msg_ids],
+                    random_id=[helpers.generate_random_long() for _ in id_list],
                     drop_author=True,
                     drop_media_captions=drop_caps,
                 ))
-                sent_ok = True
-                break
+                return True, False
             except ChatForwardsRestrictedError:
                 restricted_source_chats.add(src_canon)
-                logger.info(f"Batch forward restricted on {s_title} -> switching batch ({len(batch)}) to Turbo download pipeline")
-                return 0, batch
+                logger.info(f"Batch forward restricted on {s_title} -> switching to Turbo transfer")
+                return False, True
             except FloodWaitError as fl:
                 wait_s = min(fl.seconds + 2, 120)
                 logger.warning(f"Batch Forward FloodWait ({fl.seconds}s): sleeping {wait_s}s...")
                 await asyncio.sleep(wait_s)
             except (ChatWriteForbiddenError, ChannelPrivateError, PeerIdInvalidError):
                 bot_only_targets.append(tid)
-                break
+                return False, False
             except Exception as e:
                 err_s = str(e).lower()
-                if "protected" in err_s or "forwards" in err_s:
+                if "protected" in err_s or "chat_forwards_restricted" in err_s or "forward" in err_s and "restrict" in err_s:
                     restricted_source_chats.add(src_canon)
-                    return 0, batch
-                logger.warning(f"Batch RPC fallback on {tid}: {e}")
-                return 0, batch
-        if sent_ok:
+                    return False, True
+                logger.warning(f"Batch RPC error on {tid} (count={len(id_list)}): {e}")
+                return False, False
+        return False, False
+
+    for tid in valid_targets:
+        tgt_ent = await get_entity_safe(src_client, tid, f"u_{acc_id}")
+        if not tgt_ent:
+            bot_only_targets.append(tid)
+            continue
+
+        ok, is_restr = await send_forward_ids(tgt_ent, tid, msg_ids)
+        if is_restr:
+            return 0, batch
+        if ok:
             user_ok_targets += 1
+            continue
+
+        # If target wasn't bot-only, retry each message individually so 1 bad message doesn't force 19 downloads!
+        if tid not in bot_only_targets and len(batch) > 1:
+            indiv_ok = 0
+            for m in batch:
+                m_ok, m_restr = await send_forward_ids(tgt_ent, tid, [m.id])
+                if m_restr:
+                    return 0, batch
+                if m_ok:
+                    indiv_ok += 1
+                else:
+                    fallback_msgs_by_id[m.id] = m
+            if indiv_ok > 0:
+                user_ok_targets += 1
+        elif tid not in bot_only_targets:
+            fallback_msgs_by_id[batch[0].id] = batch[0]
+
+    # Gentle spacing helps avoid repetitive 21s ForwardMessagesRequest flood waits
+    if user_ok_targets > 0:
+        await asyncio.sleep(0.45)
+
+    succeeded_msgs = [m for m in batch if m.id not in fallback_msgs_by_id]
+    rej_msgs = list(fallback_msgs_by_id.values())
 
     if user_ok_targets > 0:
-        for m in batch:
+        for m in succeeded_msgs:
             _record_fingerprint_and_count(profile, get_media_fingerprint(m), count=1, defer_save=True)
 
     bot_delivered = 0
     if bot_only_targets:
-        for m in batch:
+        for m in succeeded_msgs:
             res = await distribute_video(
                 src_client, m, source_id, s_title, prof_key,
                 send_notification=False, target_ids_override=bot_only_targets, defer_save=True
@@ -1481,9 +1592,9 @@ async def _batch_forward_unrestricted(
                 bot_delivered += 1
 
     if user_ok_targets > 0:
-        return len(batch), []
+        return len(succeeded_msgs), rej_msgs
     if bot_delivered > 0:
-        return bot_delivered, []
+        return bot_delivered, rej_msgs
     return 0, batch
 
 async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat_id: int, status_msg_id: int):
@@ -1492,6 +1603,9 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
     sync_state["should_stop"] = False
     sync_state["copied"] = 0
     sync_state["scanned"] = 0
+    sync_state["chat_id"] = reply_chat_id
+    sync_state["msg_id"] = status_msg_id
+    sync_state["task"] = asyncio.current_task()
 
     profile = get_profile(prof_key)
     source_ids = list(profile.get("source_ids", []))
@@ -1507,6 +1621,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
             buttons=[[Button.inline("📲 অ্যাকাউন্ট কানেক্ট করুন", f"login:{prof_key}".encode())], [Button.inline("🔙 মূল মেন্যু", f"home:{prof_key}".encode())]]
         )
         sync_state["running"] = False
+        sync_state["task"] = None
         return
 
     if not source_ids or not target_ids:
@@ -1516,6 +1631,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
             buttons=[[Button.inline("🔙 মূল মেন্যু", f"home:{prof_key}".encode())]]
         )
         sync_state["running"] = False
+        sync_state["task"] = None
         return
 
     copied = 0
@@ -1526,14 +1642,17 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
     cur_expected = 0
     last_edit = 0.0
     unsaved_ops = 0
+    state_lock = asyncio.Lock()
 
     async def maybe_update_progress(current_title: str, mode_label: str, force: bool = False):
         nonlocal last_edit
+        if sync_state["should_stop"]:
+            return
         now = time.monotonic()
         if not force and (now - last_edit < 4.0):
             return
         last_edit = now
-        exp_txt = f" (মোট ভিডিও: ~<code>{cur_expected}</code>)" if cur_expected > 0 else ""
+        exp_txt = f" (মোট: ~<code>{cur_expected}</code>)" if cur_expected > 0 else ""
         try:
             await bot_client.edit_message(
                 reply_chat_id,
@@ -1542,7 +1661,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                 f"📥 সোর্স: <code>{len(source_ids)}</code> টি | 📤 টার্গেট: <code>{len(target_ids)}</code> টি\n"
                 f"🎬 বর্তমান চ্যাট: <b>{h(current_title)}</b>{exp_txt}\n"
                 f"🔎 স্ক্যান: <code>{scanned}</code> | ✅ ফরোয়ার্ড: <code>{copied}</code> টি\n"
-                f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/GIF বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n\n"
+                f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/অন্যান্য বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n\n"
                 f"🚀 <i>টার্বো পাইপলাইন সক্রিয়...</i>",
                 buttons=[[Button.inline("🛑 সিঙ্ক থামান (Stop)", f"stop:{prof_key}".encode())]]
             )
@@ -1551,6 +1670,7 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
         except Exception:
             pass
 
+    was_cancelled = False
     try:
         for sid in source_ids:
             if sync_state["should_stop"] or (limit_count and copied >= limit_count):
@@ -1566,245 +1686,277 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
                 if getattr(s_entity, "noforwards", False):
                     restricted_source_chats.add(src_canon)
 
-                # Probe Telegram server video index when video_only mode is active
-                filter_obj = None
-                cur_expected = 0
+                # Probe BOTH Video gallery index AND Document files so no video-as-file is ever skipped!
+                scan_passes: list[tuple[object | None, int, str]] = []
                 if profile.get("media_filter", "video_only") == "video_only":
+                    vid_tot = 0
+                    doc_tot = 0
                     try:
                         vid_probe = await src_client.get_messages(s_entity, limit=1, filter=types.InputMessagesFilterVideo)
                         vid_tot = getattr(vid_probe, "total", 0) or len(vid_probe)
-                        if vid_tot > 0:
-                            filter_obj = types.InputMessagesFilterVideo
-                            cur_expected = vid_tot
                     except Exception:
                         pass
+                    try:
+                        doc_probe = await src_client.get_messages(s_entity, limit=1, filter=types.InputMessagesFilterDocument)
+                        doc_tot = getattr(doc_probe, "total", 0) or len(doc_probe)
+                    except Exception:
+                        pass
+                    if vid_tot > 0:
+                        scan_passes.append((types.InputMessagesFilterVideo, vid_tot, "VideoIndex"))
+                    if doc_tot > 0:
+                        scan_passes.append((types.InputMessagesFilterDocument, doc_tot, "DocIndex"))
+                    if not scan_passes:
+                        scan_passes.append((None, 0, "FullHistory"))
+                else:
+                    scan_passes.append((None, 0, "AllMedia"))
 
                 dup_on = profile.get("duplicate_protection", True)
                 seen_set = set(profile.get("seen_fingerprints", [])) if dup_on else set()
-                logger.info(f"📂 [{prof_key}] Scanning source '{s_title}' ({sid}) | expected_videos={cur_expected or 'all'} | filter={'VideoIndex' if filter_obj else 'FullHistory'}")
+                seen_source_msg_ids: set[int] = set()
 
-                fallback_seed_msgs = []
-                msg_iter = resilient_iter_messages(
-                    src_client,
-                    s_entity,
-                    filter_obj=filter_obj,
-                    server_total=cur_expected,
-                    should_stop_fn=lambda: bool(sync_state["should_stop"] or (limit_count and copied >= limit_count)),
-                    label=s_title,
-                )
+                for pass_filter, pass_total, pass_name in scan_passes:
+                    if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                        break
 
-                # Stage A (Unrestricted sources): Instant 20x Cloud Batch Forward via ForwardMessagesRequest
-                if src_canon not in restricted_source_chats:
-                    batch = []
-                    async for msg in msg_iter:
-                        if sync_state["should_stop"] or (limit_count and copied >= limit_count):
-                            break
-                        scanned += 1
-                        sync_state["scanned"] = scanned
+                    cur_expected = pass_total
+                    logger.info(f"📂 [{prof_key}] Scanning '{s_title}' ({sid}) | pass={pass_name} | expected={pass_total or 'all'}")
 
-                        if not is_eligible_media(msg, profile):
-                            skipped_other += 1
-                            if scanned % 80 == 0:
-                                await maybe_update_progress(s_title, "ব্যাচ স্ক্যান")
-                            continue
+                    fallback_seed_msgs = []
+                    raw_iter = resilient_iter_messages(
+                        src_client,
+                        s_entity,
+                        filter_obj=pass_filter,
+                        server_total=pass_total,
+                        should_stop_fn=lambda: bool(sync_state["should_stop"] or (limit_count and copied >= limit_count)),
+                        label=f"{s_title}:{pass_name}",
+                    )
 
-                        fp = get_media_fingerprint(msg)
-                        if dup_on and fp:
-                            if fp in seen_set:
-                                skipped_dup += 1
-                                if skipped_dup % 100 == 0:
+                    async def dedup_msg_iter():
+                        async for m in raw_iter:
+                            if m.id in seen_source_msg_ids:
+                                continue
+                            seen_source_msg_ids.add(m.id)
+                            yield m
+
+                    msg_iter = dedup_msg_iter()
+
+                    # Stage A (Unrestricted sources): Instant 20x Cloud Batch Forward via ForwardMessagesRequest
+                    if src_canon not in restricted_source_chats:
+                        batch = []
+                        async for msg in msg_iter:
+                            if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                                break
+                            scanned += 1
+                            sync_state["scanned"] = scanned
+
+                            if not is_eligible_media(msg, profile):
+                                skipped_other += 1
+                                if scanned % 80 == 0:
                                     await maybe_update_progress(s_title, "ব্যাচ স্ক্যান")
                                 continue
-                            seen_set.add(fp)
 
-                        _, (sw, sh) = build_video_attributes(msg, None)
-                        is_broken = is_video_message(msg) and getattr(msg, "document", None) and (sw <= 16 or sh <= 16)
-                        if is_broken:
-                            res = await distribute_video(src_client, msg, sid, s_title, prof_key, send_notification=False, defer_save=True)
-                            if res:
-                                copied += 1
-                                unsaved_ops += 1
-                                sync_state["copied"] = copied
+                            fp = get_media_fingerprint(msg)
+                            if dup_on and fp:
+                                if fp in seen_set:
+                                    skipped_dup += 1
+                                    if skipped_dup % 100 == 0:
+                                        await maybe_update_progress(s_title, "ব্যাচ স্ক্যান")
+                                    continue
+                                seen_set.add(fp)
+
+                            _, (sw, sh) = build_video_attributes(msg, None)
+                            is_broken = is_video_message(msg) and getattr(msg, "document", None) and (sw <= 16 or sh <= 16)
+                            if is_broken:
+                                res = await distribute_video(src_client, msg, sid, s_title, prof_key, send_notification=False, defer_save=True)
+                                if res:
+                                    copied += 1
+                                    unsaved_ops += 1
+                                    sync_state["copied"] = copied
+                                else:
+                                    failed += 1
                             else:
-                                failed += 1
-                        else:
-                            batch.append(msg)
+                                batch.append(msg)
 
-                        max_batch = min(BULK_BATCH_SIZE, limit_count - copied) if limit_count else BULK_BATCH_SIZE
-                        if len(batch) >= max(1, max_batch):
+                            max_batch = min(BULK_BATCH_SIZE, limit_count - copied) if limit_count else BULK_BATCH_SIZE
+                            if len(batch) >= max(1, max_batch):
+                                ok_n, rej = await _batch_forward_unrestricted(
+                                    src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
+                                )
+                                batch = []
+                                if ok_n:
+                                    copied += ok_n
+                                    unsaved_ops += ok_n
+                                    sync_state["copied"] = copied
+                                if rej:
+                                    fallback_seed_msgs.extend(rej)
+                                if unsaved_ops >= 15:
+                                    save_state()
+                                    unsaved_ops = 0
+                                await maybe_update_progress(s_title, "ডিরেক্ট ফরোয়ার্ড")
+                                if src_canon in restricted_source_chats:
+                                    break
+
+                            if limit_count and copied >= limit_count:
+                                break
+
+                        if batch and not sync_state["should_stop"] and (not limit_count or copied < limit_count):
                             ok_n, rej = await _batch_forward_unrestricted(
                                 src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
                             )
-                            batch = []
                             if ok_n:
                                 copied += ok_n
                                 unsaved_ops += ok_n
                                 sync_state["copied"] = copied
                             if rej:
                                 fallback_seed_msgs.extend(rej)
-                            if unsaved_ops >= 15:
-                                save_state()
-                                unsaved_ops = 0
-                            await maybe_update_progress(s_title, "সুপার-ফাস্ট ব্যাচ")
-                            if src_canon in restricted_source_chats:
-                                break
 
-                        if limit_count and copied >= limit_count:
-                            break
+                    drain_remaining_iter = (src_canon in restricted_source_chats)
+                    if not drain_remaining_iter and not fallback_seed_msgs:
+                        continue
 
-                    if batch and not sync_state["should_stop"] and (not limit_count or copied < limit_count):
-                        ok_n, rej = await _batch_forward_unrestricted(
-                            src_client, s_entity, sid, src_canon, s_title, batch, profile, prof_key, target_ids
-                        )
-                        if ok_n:
-                            copied += ok_n
-                            unsaved_ops += ok_n
-                            sync_state["copied"] = copied
-                        if rej:
-                            fallback_seed_msgs.extend(rej)
+                    # Stage B (Restricted/Protected or fallback items): 2x Prefetch + 2x Upload Workers
+                    if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                        continue
 
-                drain_remaining_iter = (src_canon in restricted_source_chats)
-                if not drain_remaining_iter and not fallback_seed_msgs:
-                    continue
+                    logger.info(f"🚀 [{prof_key}] Running Turbo Prefetch Pipeline on: {s_title} ({pass_name}, seeds={len(fallback_seed_msgs)}, stream={drain_remaining_iter})")
+                    prefetch_q: asyncio.Queue = asyncio.Queue(maxsize=4)
+                    dl_sem = asyncio.Semaphore(2)
+                    created_tasks: list[asyncio.Task] = []
+                    num_upload_workers = 2
 
-                # Stage B (Restricted/Protected or fallback items): 2x Background Prefetch + 512KB Turbo Transfer Pipeline
-                if sync_state["should_stop"] or (limit_count and copied >= limit_count):
-                    continue
+                    async def _prefetch_job(m):
+                        async with dl_sem:
+                            if sync_state["should_stop"]:
+                                return None
+                            return await prepare_video_payload(src_client, m, src_canon, source_peer=sid)
 
-                logger.info(f"🚀 [{prof_key}] Running Turbo Prefetch Pipeline on source: {s_title} (seeds={len(fallback_seed_msgs)}, stream_rest={drain_remaining_iter})")
-                prefetch_q: asyncio.Queue = asyncio.Queue(maxsize=3)
-                dl_sem = asyncio.Semaphore(2)
-                created_tasks: list[asyncio.Task] = []
-
-                async def _prefetch_job(m):
-                    async with dl_sem:
-                        if sync_state["should_stop"]:
-                            return None
-                        return await prepare_video_payload(src_client, m, src_canon, source_peer=sid)
-
-                async def _producer():
-                    nonlocal scanned, skipped_dup, skipped_other
-                    enqueued = 0
-                    try:
-                        for seed_m in fallback_seed_msgs:
-                            if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
-                                break
-                            t = asyncio.create_task(_prefetch_job(seed_m))
-                            created_tasks.append(t)
-                            await prefetch_q.put((seed_m, t))
-                            enqueued += 1
-
-                        if drain_remaining_iter:
-                            async for msg in msg_iter:
+                    async def _producer():
+                        nonlocal scanned, skipped_dup, skipped_other
+                        enqueued = 0
+                        try:
+                            for seed_m in fallback_seed_msgs:
                                 if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
                                     break
-                                scanned += 1
-                                sync_state["scanned"] = scanned
-
-                                if not is_eligible_media(msg, profile):
-                                    skipped_other += 1
-                                    continue
-                                fp = get_media_fingerprint(msg)
-                                if dup_on and fp:
-                                    if fp in seen_set:
-                                        skipped_dup += 1
-                                        if skipped_dup % 100 == 0:
-                                            await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
-                                        continue
-                                    seen_set.add(fp)
-
-                                t = asyncio.create_task(_prefetch_job(msg))
+                                t = asyncio.create_task(_prefetch_job(seed_m))
                                 created_tasks.append(t)
-                                await prefetch_q.put((msg, t))
+                                await prefetch_q.put((seed_m, t))
                                 enqueued += 1
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as pe:
-                        logger.error(f"Prefetch producer error on {s_title}: {pe}")
-                    finally:
-                        await prefetch_q.put(None)
 
-                prod_task = asyncio.create_task(_producer())
-                try:
-                    while True:
-                        item = await prefetch_q.get()
-                        if item is None:
-                            break
-                        m, dl_task = item
-                        if sync_state["should_stop"] or (limit_count and copied >= limit_count):
-                            dl_task.cancel()
-                            continue
-                        payload = None
-                        try:
-                            payload = await dl_task
+                            if drain_remaining_iter:
+                                async for msg in msg_iter:
+                                    if sync_state["should_stop"] or (limit_count and (copied + enqueued) >= limit_count):
+                                        break
+                                    scanned += 1
+                                    sync_state["scanned"] = scanned
+
+                                    if not is_eligible_media(msg, profile):
+                                        skipped_other += 1
+                                        continue
+                                    fp = get_media_fingerprint(msg)
+                                    if dup_on and fp:
+                                        if fp in seen_set:
+                                            skipped_dup += 1
+                                            if skipped_dup % 100 == 0:
+                                                await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
+                                            continue
+                                        seen_set.add(fp)
+
+                                    t = asyncio.create_task(_prefetch_job(msg))
+                                    created_tasks.append(t)
+                                    await prefetch_q.put((msg, t))
+                                    enqueued += 1
                         except asyncio.CancelledError:
-                            continue
-                        except Exception as dl_ex:
-                            logger.warning(f"Prefetch task failed for msg {m.id}: {dl_ex}")
+                            raise
+                        except Exception as pe:
+                            logger.error(f"Prefetch producer error on {s_title}: {pe}")
+                        finally:
+                            for _ in range(num_upload_workers):
+                                await prefetch_q.put(None)
+
+                    async def _upload_worker():
+                        nonlocal copied, failed, unsaved_ops
+                        while True:
+                            item = await prefetch_q.get()
+                            if item is None:
+                                prefetch_q.task_done()
+                                break
+                            m, dl_task = item
                             payload = None
-
-                        if sync_state["should_stop"]:
-                            _cleanup_payload(payload)
-                            break
-
-                        res = await distribute_video(
-                            src_client, m, sid, s_title, prof_key,
-                            send_notification=False, preloaded=payload, defer_save=True
-                        )
-                        if res:
-                            copied += 1
-                            unsaved_ops += 1
-                            sync_state["copied"] = copied
-                            if unsaved_ops >= 10:
-                                save_state()
-                                unsaved_ops = 0
-                            await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
-                        else:
-                            failed += 1
-                            await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
-
-                        if limit_count and copied >= limit_count:
-                            break
-                finally:
-                    prod_task.cancel()
-                    try:
-                        await prod_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    for t in created_tasks:
-                        if not t.done():
-                            t.cancel()
-                        elif not t.cancelled():
                             try:
-                                _cleanup_payload(t.result())
-                            except Exception:
-                                pass
-                    while not prefetch_q.empty():
-                        left = prefetch_q.get_nowait()
-                        if left and isinstance(left, tuple):
-                            _, lt = left
-                            if not lt.done():
-                                lt.cancel()
-                            elif not lt.cancelled():
+                                if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                                    dl_task.cancel()
+                                    continue
                                 try:
-                                    _cleanup_payload(lt.result())
+                                    payload = await dl_task
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as dl_ex:
+                                    logger.warning(f"Prefetch failed for msg {m.id}: {dl_ex}")
+                                    payload = None
+
+                                if sync_state["should_stop"] or (limit_count and copied >= limit_count):
+                                    _cleanup_payload(payload)
+                                    continue
+
+                                res = await distribute_video(
+                                    src_client, m, sid, s_title, prof_key,
+                                    send_notification=False, preloaded=payload, defer_save=True
+                                )
+                                payload = None  # distribute_video already cleaned up payload
+                                async with state_lock:
+                                    if res:
+                                        copied += 1
+                                        unsaved_ops += 1
+                                        sync_state["copied"] = copied
+                                        if unsaved_ops >= 10:
+                                            save_state()
+                                            unsaved_ops = 0
+                                    else:
+                                        failed += 1
+                                    await maybe_update_progress(s_title, "টার্বো ৫১২কেবি")
+                            finally:
+                                _cleanup_payload(payload)
+                                prefetch_q.task_done()
+
+                    prod_task = asyncio.create_task(_producer())
+                    workers = [asyncio.create_task(_upload_worker()) for _ in range(num_upload_workers)]
+                    try:
+                        await asyncio.gather(*workers)
+                    finally:
+                        prod_task.cancel()
+                        for w in workers:
+                            if not w.done():
+                                w.cancel()
+                        await asyncio.gather(prod_task, *workers, return_exceptions=True)
+                        for t in created_tasks:
+                            if not t.done():
+                                t.cancel()
+                            elif not t.cancelled():
+                                try:
+                                    _cleanup_payload(t.result())
                                 except Exception:
                                     pass
+                        while not prefetch_q.empty():
+                            left = prefetch_q.get_nowait()
+                            if left and isinstance(left, tuple):
+                                _, lt = left
+                                if not lt.done():
+                                    lt.cancel()
+                                elif not lt.cancelled():
+                                    try:
+                                        _cleanup_payload(lt.result())
+                                    except Exception:
+                                        pass
+            except asyncio.CancelledError:
+                raise
             except Exception as src_err:
                 logger.error(f"Source sync error on {sid} ({prof_key}): {src_err}")
                 failed += 1
                 continue
-
-        status_hdr = "🛑 <b>সিঙ্ক বন্ধ করা হয়েছে!</b>" if sync_state["should_stop"] else "🎉 <b>মাল্টি-সিঙ্ক সফলভাবে সম্পন্ন হয়েছে!</b>"
-        await bot_client.edit_message(
-            reply_chat_id,
-            status_msg_id,
-            f"{status_hdr}\n\n"
-            f"🔎 মোট স্ক্যান: <code>{scanned}</code> টি | ✅ ফরোয়ার্ড: <code>{copied}</code> টি\n"
-            f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/GIF বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n"
-            f"📊 সর্বমোট ফরোয়ার্ড: <code>{profile.get('forwarded_count', 0)}</code> টি",
-            buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]]
-        )
+    except asyncio.CancelledError:
+        was_cancelled = True
+        sync_state["should_stop"] = True
+        logger.info(f"🛑 Multi-sync task cancelled immediately for [{prof_key}] (copied={copied})")
     except Exception as e:
         logger.error(f"Bulk sync error [{prof_key}]: {e}")
         try:
@@ -1816,9 +1968,37 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
             )
         except Exception:
             pass
+    else:
+        status_hdr = "🛑 <b>সিঙ্ক বন্ধ করা হয়েছে!</b>" if sync_state["should_stop"] else "🎉 <b>মাল্টি-সিঙ্ক সফলভাবে সম্পন্ন হয়েছে!</b>"
+        try:
+            await bot_client.edit_message(
+                reply_chat_id,
+                status_msg_id,
+                f"{status_hdr}\n\n"
+                f"🔎 মোট স্ক্যান: <code>{scanned}</code> টি | ✅ ফরোয়ার্ড: <code>{copied}</code> টি\n"
+                f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/অন্যান্য বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n"
+                f"📊 সর্বমোট ফরোয়ার্ড: <code>{profile.get('forwarded_count', 0)}</code> টি",
+                buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]]
+            )
+        except Exception:
+            pass
     finally:
+        if was_cancelled:
+            try:
+                await bot_client.edit_message(
+                    reply_chat_id,
+                    status_msg_id,
+                    f"🛑 <b>সিঙ্ক তাৎক্ষণিকভাবে বন্ধ করা হয়েছে!</b>\n\n"
+                    f"🔎 মোট স্ক্যান: <code>{scanned}</code> টি | ✅ ফরোয়ার্ড: <code>{copied}</code> টি\n"
+                    f"♻️ ডুপ্লিকেট বাদ: <code>{skipped_dup}</code> | 🚫 স্টিকার/অন্যান্য বাদ: <code>{skipped_other}</code> | ⚠️ ব্যর্থ: <code>{failed}</code>\n"
+                    f"📊 সর্বমোট ফরোয়ার্ড: <code>{profile.get('forwarded_count', 0)}</code> টি",
+                    buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]]
+                )
+            except Exception:
+                pass
         save_state()
         sync_state["running"] = False
+        sync_state["task"] = None
 
 # ==================== UI TEXT & BUTTON BUILDERS ====================
 
@@ -2512,6 +2692,20 @@ async def bot_id_cmd_handler(event):
         f"• Sender ID: <code>{event.sender_id}</code>"
     )
 
+@bot_client.on(events.NewMessage(pattern=r"^/stop(?:@autforwbdbot)?$"))
+async def bot_stop_cmd_handler(event):
+    if event.out or not await is_operator_authorized(event):
+        return
+    prof_key, _ = await resolve_profile_key_from_chat(event)
+    stopped, matched_key = trigger_sync_stop(prof_key, getattr(event, "sender_id", None), event.chat_id)
+    if stopped:
+        await event.reply("🛑 <b>সিঙ্ক তাৎক্ষণিকভাবে বন্ধ করা হচ্ছে...</b>")
+    else:
+        await event.reply(
+            "ℹ️ এই মুহূর্তে কোনো সিঙ্ক চলছে না।",
+            buttons=[[Button.inline("🎛️ মূল ড্যাশবোর্ড", f"home:{matched_key}".encode())]],
+        )
+
 # ==================== BOT CALLBACK HANDLER ====================
 
 @bot_client.on(events.CallbackQuery)
@@ -2781,21 +2975,29 @@ async def bot_callback_handler(event):
         return
 
     if cmd == "stop":
-        sync_state = get_active_sync(prof_key)
-        if sync_state["running"]:
-            sync_state["should_stop"] = True
-            await event.answer("🛑 সিঙ্ক থামানো হচ্ছে...", alert=True)
+        stopped, matched_key = trigger_sync_stop(prof_key, event.sender_id, event.chat_id)
+        if stopped:
+            await event.answer("🛑 সিঙ্ক সাথে সাথে বন্ধ করা হচ্ছে...", alert=False)
+            await safe_edit_message(
+                event,
+                "🛑 <b>সিঙ্ক তাৎক্ষণিকভাবে বন্ধ করা হচ্ছে...</b>",
+                buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{matched_key}".encode())]],
+            )
         else:
-            await event.answer("কোনো সিঙ্ক চলছে না।", alert=True)
+            await event.answer("এই মুহূর্তে কোনো সিঙ্ক চলছে না।", alert=True)
             await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
         return
 
     if cmd == "sync":
         sync_state = get_active_sync(prof_key)
-        if sync_state["running"]:
+        existing_task = sync_state.get("task")
+        if sync_state["running"] and existing_task and not existing_task.done():
             await event.answer("⚠️ ইতিমধ্যেই একটি সিঙ্ক চলছে!", alert=True)
             return
-        limit_val = int(parts[2]) if len(parts) > 2 else 0
+        try:
+            limit_val = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            limit_val = 0
         limit_count = None if limit_val == 0 else limit_val
 
         if not profile.get("source_ids"):
@@ -2815,7 +3017,7 @@ async def bot_callback_handler(event):
             buttons=[[Button.inline("🛑 সিঙ্ক থামান (Stop)", f"stop:{prof_key}".encode())]]
         )
         msg_id = status_msg.id if status_msg else event.message_id
-        asyncio.create_task(run_multi_bulk_sync(prof_key, limit_count, event.chat_id, msg_id))
+        sync_state["task"] = asyncio.create_task(run_multi_bulk_sync(prof_key, limit_count, event.chat_id, msg_id))
         return
 
 # ==================== BOT MESSAGE HANDLER (LOGIN, LINKS, MEDIA) ====================
@@ -2976,7 +3178,8 @@ async def bot_message_handler(event):
                     if any(to_canonical_id(item["id"]) == canon_chat_id for item in uc_cache):
                         has_userbot_in_chat = True
                 if not has_userbot_in_chat:
-                    s_title = profile.get("source_titles", {}).get(str(event.chat_id), "Channel")
+                    s_titles = profile.get("source_titles", {})
+                    s_title = s_titles.get(str(event.chat_id), s_titles.get(str(canon_chat_id), "Channel"))
                     enqueue_incoming_video(bot_client, event.message, event.chat_id, s_title, prof_key)
         return
 
