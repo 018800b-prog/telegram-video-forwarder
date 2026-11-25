@@ -3,3 +3,6 @@ python-dotenv>=1.0.0
 cryptg>=0.4.0
 aiofiles>=23.2.0
 tqdm>=4.66.0
+hachoir>=3.2.0
+qrcode>=7.4.2
+pillow>=10.0.0

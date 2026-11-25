@@ -24,15 +24,23 @@ Fixes & Features:
 
 import os
 import re
+import io
 import sys
 import html
 import json
+import math
 import time
+import struct
 import shutil
 import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
 
 from telethon import TelegramClient, events, Button, utils, functions, types
 from telethon.sessions import StringSession
@@ -353,6 +361,137 @@ def safe_caption_and_entities(message, caption_mode: str):
         valid_entities = [e for e in entities if (e.offset + e.length) <= 1017]
     return truncated, valid_entities or None
 
+def extract_mp4_metadata(filepath: Path) -> tuple[int, int, float]:
+    """Zero-RAM seek-based MP4 mvhd/tkhd parser returning exact (width, height, duration) including rotation."""
+    try:
+        file_size = filepath.stat().st_size
+        duration = 0.0
+        tracks = []
+
+        def walk(f, start: int, end: int):
+            nonlocal duration
+            pos = start
+            while pos + 8 <= end:
+                f.seek(pos)
+                hdr_bytes = f.read(8)
+                if len(hdr_bytes) < 8:
+                    break
+                size, btype = struct.unpack(">I4s", hdr_bytes)
+                hdr = 8
+                if size == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    size = struct.unpack(">Q", ext)[0]
+                    hdr = 16
+                elif size == 0:
+                    size = end - pos
+                if size < hdr or pos + size > end:
+                    break
+                body_start, body_end = pos + hdr, pos + size
+                if btype in (b"moov", b"trak"):
+                    walk(f, body_start, body_end)
+                elif btype == b"mvhd" and body_end - body_start >= 20:
+                    f.seek(body_start)
+                    buf = f.read(min(36, body_end - body_start))
+                    ver = buf[0]
+                    if ver == 0 and len(buf) >= 20:
+                        ts, dur = struct.unpack(">II", buf[12:20])
+                        if ts:
+                            duration = max(duration, dur / ts)
+                    elif ver == 1 and len(buf) >= 32:
+                        ts, dur = struct.unpack(">IQ", buf[20:32])
+                        if ts:
+                            duration = max(duration, dur / ts)
+                elif btype == b"tkhd" and body_end - body_start >= 84:
+                    f.seek(body_start)
+                    buf = f.read(min(100, body_end - body_start))
+                    ver = buf[0]
+                    off = 88 if ver == 1 else 76
+                    mat_off = 44 if ver == 1 else 32
+                    if len(buf) >= off + 8:
+                        a, b, _, c, d = struct.unpack(">iiiii", buf[mat_off:mat_off + 20])
+                        w_raw, h_raw = struct.unpack(">II", buf[off:off + 8])
+                        w = int(round(w_raw / 65536.0))
+                        h = int(round(h_raw / 65536.0))
+                        if w > 1 and h > 1:
+                            angle = abs(round(math.degrees(math.atan2(b / 65536.0, a / 65536.0))))
+                            if angle in (90, 270):
+                                w, h = h, w
+                            tracks.append((w, h))
+                pos += size
+
+        with open(filepath, "rb") as f:
+            walk(f, 0, file_size)
+        if tracks:
+            return tracks[0][0], tracks[0][1], duration
+    except Exception as e:
+        logger.debug(f"MP4 box parse fallback: {e}")
+
+    # Optional hachoir fallback for MKV / WebM / AVI
+    try:
+        from hachoir.parser import createParser
+        from hachoir.metadata import extractMetadata
+        parser = createParser(str(filepath))
+        if parser:
+            with parser:
+                meta = extractMetadata(parser)
+                if meta:
+                    w = meta.get("width") if meta.has("width") else 0
+                    h = meta.get("height") if meta.has("height") else 0
+                    dur = meta.get("duration").total_seconds() if meta.has("duration") else 0.0
+                    if w > 1 and h > 1:
+                        return int(w), int(h), float(dur)
+    except Exception:
+        pass
+    return 0, 0, 0.0
+
+def build_video_attributes(message, downloaded_path: Path | None = None):
+    """
+    Constructs exact non-zoomed video attributes preserving original aspect ratio and duration.
+    Prevents Telethon's 1x1 square zoom bug completely.
+    """
+    orig_w, orig_h, orig_dur = 0, 0, 0.0
+    round_msg = False
+    nosound = False
+    orig_name = None
+
+    if getattr(message, "document", None) and getattr(message.document, "attributes", None):
+        for a in message.document.attributes:
+            if isinstance(a, types.DocumentAttributeVideo):
+                orig_w = getattr(a, "w", 0) or 0
+                orig_h = getattr(a, "h", 0) or 0
+                orig_dur = float(getattr(a, "duration", 0) or 0)
+                round_msg = bool(getattr(a, "round_message", False))
+                nosound = bool(getattr(a, "nosound", False))
+            elif isinstance(a, types.DocumentAttributeFilename):
+                orig_name = getattr(a, "file_name", None)
+
+    final_w, final_h, final_dur = orig_w, orig_h, orig_dur
+    # If source metadata was invalid (e.g. 1x1 or missing) and we have the file, measure real native dimensions!
+    if (final_w <= 16 or final_h <= 16 or final_dur <= 0) and downloaded_path and downloaded_path.exists():
+        rw, rh, rdur = extract_mp4_metadata(downloaded_path)
+        if rw > 16 and rh > 16 and (final_w <= 16 or final_h <= 16):
+            final_w, final_h = rw, rh
+        if rdur > 0 and final_dur <= 0:
+            final_dur = rdur
+
+    attrs = []
+    if final_w > 16 and final_h > 16:
+        attrs.append(types.DocumentAttributeVideo(
+            duration=final_dur,
+            w=final_w,
+            h=final_h,
+            round_message=round_msg,
+            supports_streaming=True,
+            nosound=nosound,
+        ))
+    if orig_name:
+        attrs.append(types.DocumentAttributeFilename(file_name=orig_name))
+    elif downloaded_path:
+        attrs.append(types.DocumentAttributeFilename(file_name=downloaded_path.name))
+    return attrs or None, (final_w, final_h)
+
 # ==================== ENTITY & DIALOG RESOLUTION ====================
 
 async def get_entity_safe(client: TelegramClient, chat_id: int, client_key: str = "default"):
@@ -601,13 +740,11 @@ async def distribute_video(
     primary_client = user_clients.get(acc_id) if (acc_id and acc_id in user_clients) else source_client
     source_key = "bot" if source_client is bot_client else f"u_{acc_id or 'src'}"
 
-    # Preserve video metadata + thumbnail if fallback download becomes needed
+    # Inspect source video dimensions BEFORE deciding cloud copy vs download repair
+    _, (src_w, src_h) = build_video_attributes(message, None)
+    is_vid = is_video_message(message)
+    source_has_broken_frame = bool(is_vid and getattr(message, "document", None) and (src_w <= 16 or src_h <= 16))
     video_attrs = None
-    if getattr(message, "document", None) and getattr(message.document, "attributes", None):
-        video_attrs = [
-            a for a in message.document.attributes
-            if isinstance(a, (types.DocumentAttributeVideo, types.DocumentAttributeFilename))
-        ]
 
     file_size = getattr(message.file, "size", 0) if message.file else 0
     ext = (getattr(message.file, "ext", None) or ".mp4") if message.file else ".mp4"
@@ -650,8 +787,8 @@ async def distribute_video(
                     except Exception as e:
                         logger.debug(f"Cloud media reuse failed on {target_title}: {e}")
 
-                # Fast path B: Direct cloud copy if sending client == source client (zero bandwidth)
-                if u_client is source_client:
+                # Fast path B: Direct cloud copy ONLY if sending client == source client AND video dimensions are intact
+                if u_client is source_client and not source_has_broken_frame:
                     try:
                         sent_msg = await upload_file_with_retry(
                             u_client, tgt_ent, message.media,
@@ -672,14 +809,16 @@ async def distribute_video(
                         else:
                             logger.warning(f"Direct forward error on {u_key}: {e}")
 
-                # Fallback path C: Download ONCE using source_client, then upload
+                # Fallback path C: Download ONCE using source_client, preserve/repair exact frame dimensions & upload
                 if downloaded_path is None:
                     try:
                         logger.info(f"📥 Downloading media ({format_size(file_size)}) once for distribution...")
                         dl = await source_client.download_media(message, file=str(temp_video_path))
                         if dl and os.path.exists(dl):
                             downloaded_path = dl
-                        if getattr(message, "document", None) and getattr(message.document, "thumbs", None):
+                            video_attrs, (real_w, real_h) = build_video_attributes(message, Path(downloaded_path))
+                            logger.info(f"📐 Verified original video frame: {real_w}x{real_h}")
+                        if not source_has_broken_frame and getattr(message, "document", None) and getattr(message.document, "thumbs", None):
                             try:
                                 th = await source_client.download_media(message, file=str(temp_thumb_path), thumb=-1)
                                 if th and os.path.exists(th):
@@ -1235,29 +1374,187 @@ async def render_targets_page(event, prof_key: str, page: int, force_refresh: bo
     )
     await safe_edit_message(event, text, buttons)
 
-# ==================== ACCOUNT MANAGER & IN-BOT LOGIN NUMPAD ====================
+# ==================== ACCOUNT MANAGER, QR LOGIN & IN-BOT NUMPAD ====================
 
-def build_numpad_text(code_digits: str, phone: str) -> str:
+def make_login_client() -> TelegramClient:
+    return TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH,
+        device_model="Samsung Galaxy S24",
+        system_version="Android 14",
+        app_version="11.5.0",
+        lang_code="en",
+        system_lang_code="en",
+    )
+
+def describe_sent_code(sent) -> str:
+    t_name = type(getattr(sent, "type", None)).__name__
+    nt_name = type(getattr(sent, "next_type", None)).__name__
+    logger.info(f"SentCode delivery: type={t_name}, next_type={nt_name}")
+    if "App" in t_name:
+        return (
+            "📲 কোডটি <b>SMS-এ নয়</b>, আপনার ওই অ্যাকাউন্টের <b>টেলিগ্রাম অ্যাপের 'Telegram' অফিশিয়াল চ্যাটে</b> পাঠানো হয়েছে!\n"
+            "<i>(যদি টেলিগ্রাম অ্যাপে না পান তবে নিচের '🔄 SMS/কল-এ পাঠান' বাটনে চাপুন অথবা '📷 QR কোড' ব্যবহার করুন)</i>"
+        )
+    if "Sms" in t_name:
+        return "📩 কোডটি আপনার নম্বরে <b>SMS</b>-এ পাঠানো হয়েছে। না পেলে নিচের '🔄 SMS/কল-এ পাঠান' অথবা '📷 QR কোড' ব্যবহার করুন।"
+    if "Call" in t_name or "MissedCall" in t_name:
+        return "📞 আপনার নম্বরে টেলিগ্রাম থেকে একটি <b>ভয়েস কল / মিসড কল</b> যাবে (শেষের ৫ ডিজিট হলো কোড)।"
+    if "Email" in t_name:
+        return "📧 টেলিগ্রাম এই নম্বরের জন্য ইমেইল ভেরিফিকেশন চাইছে! ইমেইল না থাকলে নিচের '📷 QR কোড' ব্যবহার করুন।"
+    return f"📨 ডেলিভারি মাধ্যম: <code>{h(t_name)}</code>"
+
+def build_numpad_text(code_digits: str, phone: str, delivery_note: str = "") -> str:
     padded = (code_digits + "_____")[:5]
     spaced = " ".join(list(padded))
+    note_block = f"\n{delivery_note}\n" if delivery_note else "\nআপনার টেলিগ্রাম অ্যাপের 'Telegram' চ্যাটে বা SMS-এ ৫ ডিজিটের কোড পাঠানো হয়েছে।\n"
     return (
         f"🔐 <b>টেলিগ্রাম ভেরিফিকেশন কোড দিন</b>\n\n"
-        f"📱 নম্বর: <code>{h(phone)}</code>\n"
-        f"আপনার টেলিগ্রাম অ্যাপে ৫ ডিজিটের একটি কোড পাঠানো হয়েছে।\n\n"
+        f"📱 নম্বর: <code>{h(phone)}</code>"
+        f"{note_block}\n"
         f"⚠️ <i>নিরাপত্তার জন্য কোডটি সরাসরি চ্যাটে না লিখে নিচের বাটনে চাপ দিয়ে বসান:</i>\n\n"
         f"📝 কোড: <code>[ {spaced} ]</code>"
     )
 
-def build_numpad_buttons(code_digits: str):
-    return [
+def build_numpad_buttons(code_digits: str, prof_key: str = ""):
+    rows = [
         [Button.inline("1️⃣", b"num:1"), Button.inline("2️⃣", b"num:2"), Button.inline("3️⃣", b"num:3")],
         [Button.inline("4️⃣", b"num:4"), Button.inline("5️⃣", b"num:5"), Button.inline("6️⃣", b"num:6")],
         [Button.inline("7️⃣", b"num:7"), Button.inline("8️⃣", b"num:8"), Button.inline("9️⃣", b"num:9")],
         [Button.inline("⌫ মুছুন", b"num:del"), Button.inline("0️⃣", b"num:0"), Button.inline("✅ কনফার্ম", b"num:ok")],
-        [Button.inline("❌ বাতিল করুন", b"num:cancel")],
+        [Button.inline("🔄 SMS / কল-এ আবার কোড পাঠান", b"num:resend")],
     ]
+    if prof_key:
+        rows.append([Button.inline("📷 কোড ছাড়াই QR দিয়ে কানেক্ট করুন", f"qr_login:{prof_key}".encode())])
+    rows.append([Button.inline("❌ বাতিল করুন", b"num:cancel")])
+    return rows
+
+async def run_qr_login_flow(uid: int, chat_id: int, prof_key: str):
+    """Generates a Telegram QR login image so users connect in 3s without needing SMS/OTP codes"""
+    old = pending_logins.get(uid)
+    if old and old.get("client"):
+        try:
+            await old["client"].disconnect()
+        except Exception:
+            pass
+
+    tmp_client = make_login_client()
+    st = {
+        "step": "WAIT_QR",
+        "prof_key": prof_key,
+        "created_at": time.monotonic(),
+        "client": tmp_client,
+        "digits": "",
+    }
+    pending_logins[uid] = st
+    qr_msg = None
+    try:
+        await tmp_client.connect()
+        qr_obj = await tmp_client.qr_login()
+        logger.info(f"📷 QR Login started for user {uid}")
+
+        for attempt in range(3):
+            if pending_logins.get(uid) is not st or st.get("step") != "WAIT_QR":
+                return
+            if qrcode is None:
+                raise RuntimeError("qrcode package not installed yet")
+
+            img = qrcode.make(qr_obj.url)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.name = "telegram_qr.png"
+            buf.seek(0)
+
+            cap = (
+                "📷 <b>QR কোড দিয়ে লগইন (কোনো কোড বা SMS লাগবে না!)</b>\n\n"
+                "১. যে অ্যাকাউন্টটি কানেক্ট করবেন সেই টেলিগ্রাম অ্যাপ খুলুন।\n"
+                "২. যান: <b>Settings ➡️ Devices ➡️ Link Desktop Device</b>\n"
+                "৩. এই QR কোডটি স্ক্যান করুন (অথবা স্ক্রিনশট অন্য ডিভাইস থেকে স্ক্যান করুন)।\n\n"
+                "⏳ <i>প্রতি ৩০ সেকেন্ডে অটো আপডেট হবে...</i>"
+            )
+            if qr_msg:
+                try:
+                    await qr_msg.delete()
+                except Exception:
+                    pass
+            qr_msg = await bot_client.send_file(
+                chat_id,
+                file=buf,
+                caption=cap,
+                buttons=[[Button.inline("❌ বাতিল করুন", b"num:cancel")]],
+            )
+            try:
+                await qr_obj.wait(timeout=30)
+                if pending_logins.get(uid) is not st or st.get("step") != "WAIT_QR":
+                    return
+                if qr_msg:
+                    try:
+                        await qr_msg.delete()
+                    except Exception:
+                        pass
+                await complete_inbot_login(uid, st, chat_id)
+                return
+            except asyncio.TimeoutError:
+                if attempt < 2 and pending_logins.get(uid) is st and st.get("step") == "WAIT_QR":
+                    await qr_obj.recreate()
+                continue
+            except SessionPasswordNeededError:
+                if pending_logins.get(uid) is not st or st.get("step") != "WAIT_QR":
+                    return
+                if qr_msg:
+                    try:
+                        await qr_msg.delete()
+                    except Exception:
+                        pass
+                st["step"] = "WAIT_2FA"
+                await bot_client.send_message(
+                    chat_id,
+                    "🔒 <b>QR স্ক্যান সম্পন্ন! এখন আপনার 2FA পাসওয়ার্ড লিখুন:</b>\n"
+                    "<i>(নিরাপত্তার জন্য মেসেজটি সাথে সাথেই মুছে ফেলা হবে)</i>",
+                    buttons=[[Button.inline("❌ বাতিল", b"num:cancel")]],
+                )
+                return
+
+        if pending_logins.get(uid) is st and st.get("step") == "WAIT_QR":
+            if qr_msg:
+                try:
+                    await qr_msg.delete()
+                except Exception:
+                    pass
+            pending_logins.pop(uid, None)
+            await bot_client.send_message(
+                chat_id,
+                "⏰ QR কোডের সময় শেষ হয়েছে। আবার চেষ্টা করতে বাটনে চাপুন:",
+                buttons=[
+                    [Button.inline("📷 আবার QR কোড নিন", f"qr_login:{prof_key}".encode())],
+                    [Button.inline("🔙 ড্যাশবোর্ড", f"home:{prof_key}".encode())],
+                ],
+            )
+    except Exception as e:
+        logger.warning(f"QR login error for {uid}: {e}")
+        if pending_logins.get(uid) is st and st.get("step") == "WAIT_QR":
+            pending_logins.pop(uid, None)
+            await bot_client.send_message(
+                chat_id,
+                f"❌ QR লগইন সমস্যা: <code>{h(e)}</code>",
+                buttons=[[Button.inline("🔙 ড্যাশবোর্ড", f"home:{prof_key}".encode())]],
+            )
+    finally:
+        cur = pending_logins.get(uid)
+        if cur is not st and tmp_client not in user_clients.values():
+            try:
+                await tmp_client.disconnect()
+            except Exception:
+                pass
 
 async def start_inbot_login_prompt(reply_fn, sender_id: int, prof_key: str):
+    old = pending_logins.get(sender_id)
+    if old and old.get("client"):
+        try:
+            await old["client"].disconnect()
+        except Exception:
+            pass
     pending_logins[sender_id] = {
         "step": "WAIT_PHONE",
         "prof_key": prof_key,
@@ -1266,12 +1563,22 @@ async def start_inbot_login_prompt(reply_fn, sender_id: int, prof_key: str):
     }
     await reply_fn(
         "📲 <b>আপনার টেলিগ্রাম অ্যাকাউন্ট কানেক্ট করুন</b>\n\n"
-        "এই অ্যাকাউন্টের সকল প্রাইভেট ও পাবলিক গ্রুপ স্ক্যান করতে আপনার ফোন নম্বর দিন।\n\n"
-        "👉 নিচের <b>📱 আমার ফোন নম্বর দিন</b> বাটনে চাপুন অথবা দেশ কোডসহ নম্বর লিখুন (যেমন: <code>+88017xxxxxxxx</code> বা <code>017xxxxxxxx</code>):",
+        "এই অ্যাকাউন্টের সকল প্রাইভেট ও পাবলিক গ্রুপ স্ক্যান করতে যেকোনো ১টি সহজ পদ্ধতি বেছে নিন:\n\n"
+        "🥇 <b>সবচেয়ে সহজ (কোড ছাড়াই):</b> নিচের <b>📷 QR কোড দিয়ে কানেক্ট</b> বাটনে চাপুন।\n"
+        "🥈 <b>ফোন নম্বর দিয়ে:</b> নিচের <b>📱 আমার ফোন নম্বর দিন</b> বাটনে চাপুন বা দেশ কোডসহ নম্বর লিখুন (<code>+88017xxxxxxxx</code>)।\n"
+        "🥉 <b>সেশন স্ট্রিং:</b> পিসি (<code>login.bat</code>) থেকে তৈরি Session String সরাসরি এখানে পেস্ট করতে পারেন।",
+        buttons=[
+            [Button.inline("📷 QR কোড দিয়ে কানেক্ট (সবচেয়ে সহজ, কোড লাগবে না)", f"qr_login:{prof_key}".encode())],
+            [Button.inline("❌ বাতিল", b"num:cancel")],
+        ],
+    )
+    await bot_client.send_message(
+        sender_id,
+        "👇 ফোন নম্বর শেয়ার করতে চাইলে নিচের বোতামে চাপুন অথবা নম্বর লিখুন:",
         buttons=[
             [Button.request_phone("📱 আমার ফোন নম্বর দিন", resize=True, single_use=True)],
             [Button.text("❌ বাতিল করুন", resize=True)],
-        ]
+        ],
     )
 
 async def complete_inbot_login(uid: int, state_data: dict, reply_target):
@@ -1501,36 +1808,64 @@ async def bot_callback_handler(event):
 
     raw_data = event.data.decode("utf-8", errors="ignore")
 
-    # 1. Handle Inline Login Numpad first
+    # 1. Handle Inline Login Numpad & Cancel across any step
     if raw_data.startswith("num:"):
         uid = event.sender_id
         st = pending_logins.get(uid)
+        action = raw_data.split(":", 1)[1]
+
+        if action == "cancel":
+            if st and st.get("client"):
+                try:
+                    await st["client"].disconnect()
+                except Exception:
+                    pass
+            prof_k = st.get("prof_key", str(event.chat_id)) if st else str(event.chat_id)
+            pending_logins.pop(uid, None)
+            await event.answer("❌ বাতিল করা হয়েছে", alert=False)
+            await safe_edit_message(event, "❌ অ্যাকাউন্ট লগইন বাতিল করা হয়েছে।", buttons=[[Button.inline("🔙 ড্যাশবোর্ড", f"home:{prof_k}".encode())]])
+            return
+
         if not st or st.get("step") != "WAIT_OTP":
             await event.answer("⚠️ লগইন সেশন শেষ হয়ে গেছে। আবার /login দিন।", alert=True)
             return
 
-        action = raw_data.split(":", 1)[1]
-        if action == "cancel":
+        if action == "resend":
+            await event.answer("🔄 SMS/কল-এ পুনরায় কোড পাঠানো হচ্ছে...", alert=False)
             try:
-                await st["client"].disconnect()
-            except Exception:
-                pass
-            pending_logins.pop(uid, None)
-            await event.answer("❌ বাতিল করা হয়েছে", alert=False)
-            await safe_edit_message(event, "❌ অ্যাকাউন্ট লগইন বাতিল করা হয়েছে।", buttons=[[Button.inline("🔙 ড্যাশবোর্ড", f"home:{st['prof_key']}".encode())]])
+                resent = await st["client"](functions.auth.ResendCodeRequest(st["phone"], st["hash"]))
+                st["hash"] = resent.phone_code_hash
+                st["delivery_note"] = describe_sent_code(resent)
+                st["digits"] = ""
+                await safe_edit_message(
+                    event,
+                    build_numpad_text("", st["phone"], st["delivery_note"]),
+                    buttons=build_numpad_buttons("", st["prof_key"]),
+                )
+            except Exception as re_err:
+                logger.warning(f"ResendCode failed for {st.get('phone')}: {re_err}")
+                await safe_edit_message(
+                    event,
+                    f"⚠️ পুনরায় কোড পাঠানো যায়নি: <code>{h(re_err)}</code>\n\n"
+                    f"💡 <b>সমাধান:</b> কোনো SMS ছাড়াই নিচের <b>📷 QR কোড দিয়ে কানেক্ট</b> বাটনে চাপ দিয়ে ৩ সেকেন্ডে কানেক্ট করুন!",
+                    buttons=[
+                        [Button.inline("📷 QR কোড দিয়ে কানেক্ট (সবচেয়ে সহজ)", f"qr_login:{st['prof_key']}".encode())],
+                        [Button.inline("❌ বাতিল", b"num:cancel")],
+                    ],
+                )
             return
 
         if action == "del":
             st["digits"] = st["digits"][:-1]
             await event.answer()
-            await safe_edit_message(event, build_numpad_text(st["digits"], st["phone"]), buttons=build_numpad_buttons(st["digits"]))
+            await safe_edit_message(event, build_numpad_text(st["digits"], st["phone"], st.get("delivery_note", "")), buttons=build_numpad_buttons(st["digits"], st.get("prof_key", "")))
             return
 
         if action.isdigit():
             if len(st["digits"]) < 5:
                 st["digits"] += action
                 await event.answer()
-                await safe_edit_message(event, build_numpad_text(st["digits"], st["phone"]), buttons=build_numpad_buttons(st["digits"]))
+                await safe_edit_message(event, build_numpad_text(st["digits"], st["phone"], st.get("delivery_note", "")), buttons=build_numpad_buttons(st["digits"], st.get("prof_key", "")))
             else:
                 await event.answer("৫ ডিজিট পূর্ণ হয়েছে! ✅ কনফার্ম চাপুন।", alert=False)
             return
@@ -1556,7 +1891,7 @@ async def bot_callback_handler(event):
                 )
             except PhoneCodeInvalidError:
                 st["digits"] = ""
-                await safe_edit_message(event, "❌ <b>কোডটি ভুল ছিল!</b> আবার সঠিক কোড চাপুন:\n\n" + build_numpad_text("", st["phone"]), buttons=build_numpad_buttons(""))
+                await safe_edit_message(event, "❌ <b>কোডটি ভুল ছিল!</b> আবার সঠিক কোড চাপুন:\n\n" + build_numpad_text("", st["phone"], st.get("delivery_note", "")), buttons=build_numpad_buttons("", st.get("prof_key", "")))
             except PhoneCodeExpiredError:
                 try:
                     await tmp.disconnect()
@@ -1567,6 +1902,15 @@ async def bot_callback_handler(event):
             except Exception as e:
                 await safe_edit_message(event, f"❌ লগইন সমস্যা: <code>{h(e)}</code>", buttons=[[Button.inline("🔙 ড্যাশবোর্ড", f"home:{st['prof_key']}".encode())]])
             return
+
+    if raw_data.startswith("qr_login:"):
+        if not event.is_private:
+            await event.answer("ইনবক্সে গিয়ে QR লগইন করুন!", alert=True)
+            return
+        prof_k = raw_data.split(":", 1)[1]
+        await event.answer("📷 QR কোড তৈরি হচ্ছে...", alert=False)
+        asyncio.create_task(run_qr_login_flow(event.sender_id, event.chat_id, prof_k))
+        return
 
     if raw_data == "noop":
         await event.answer()
@@ -1795,6 +2139,25 @@ async def bot_message_handler(event):
             return
 
         if st["step"] == "WAIT_PHONE":
+            # Support direct Session String paste during login!
+            if raw_text and len(raw_text) > 120 and " " not in raw_text and raw_text.startswith("1"):
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                wait_msg = await event.respond("⏳ Session String যাচাই করা হচ্ছে...", buttons=Button.clear())
+                tmp_client = TelegramClient(StringSession(raw_text.strip()), API_ID, API_HASH)
+                try:
+                    await tmp_client.connect()
+                    if not await tmp_client.is_user_authorized():
+                        raise RuntimeError("সেশন স্ট্রিংটি বৈধ নয় বা মেয়াদ শেষ।")
+                    st["client"] = tmp_client
+                    await complete_inbot_login(event.sender_id, st, event.chat_id)
+                except Exception as sess_err:
+                    await tmp_client.disconnect()
+                    await bot_client.edit_message(event.chat_id, wait_msg.id, f"❌ সেশন যুক্ত করা যায়নি: <code>{h(sess_err)}</code>")
+                return
+
             phone = ""
             if getattr(event.message, "contact", None):
                 phone = event.message.contact.phone_number or ""
@@ -1808,45 +2171,65 @@ async def bot_message_handler(event):
                 phone = "+" + phone
 
             if not phone or not re.match(r"^\+\d{8,15}$", phone):
-                await event.reply("⚠️ সঠিক ফোন নম্বর দিন (যেমন: <code>+88017xxxxxxxx</code> অথবা <code>017xxxxxxxx</code>):")
+                await event.reply("⚠️ সঠিক ফোন নম্বর দিন (যেমন: <code>+88017xxxxxxxx</code> বা <code>017xxxxxxxx</code>):")
                 return
 
             await event.reply("✅ নম্বর গ্রহণ করা হয়েছে! কোড পাঠানো হচ্ছে...", buttons=Button.clear())
             wait_msg = await bot_client.send_message(event.chat_id, "⏳ টেলিগ্রাম সার্ভারে রিকোয়েস্ট পাঠানো হচ্ছে...")
-            tmp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+            tmp_client = make_login_client()
             try:
                 await tmp_client.connect()
                 sent = await tmp_client.send_code_request(phone)
+                delivery_note = describe_sent_code(sent)
                 st["step"] = "WAIT_OTP"
                 st["phone"] = phone
                 st["client"] = tmp_client
                 st["hash"] = sent.phone_code_hash
+                st["delivery_note"] = delivery_note
                 st["digits"] = ""
                 await bot_client.edit_message(
                     event.chat_id,
                     wait_msg.id,
-                    build_numpad_text("", phone),
-                    buttons=build_numpad_buttons("")
+                    build_numpad_text("", phone, delivery_note),
+                    buttons=build_numpad_buttons("", st["prof_key"])
                 )
             except Exception as e:
+                logger.error(f"send_code_request failed for {phone}: {e}")
                 await tmp_client.disconnect()
                 pending_logins.pop(event.sender_id, None)
-                await bot_client.edit_message(event.chat_id, wait_msg.id, f"❌ কোড পাঠানো যায়নি: <code>{h(e)}</code>")
+                await bot_client.edit_message(
+                    event.chat_id,
+                    wait_msg.id,
+                    f"❌ কোড পাঠানো যায়নি: <code>{h(e)}</code>\n\n"
+                    f"💡 <b>বিকল্প সমাধান:</b> কোনো কোড ছাড়াই নিচের <b>📷 QR কোড</b> দিয়ে সহজেই কানেক্ট করুন!",
+                    buttons=[
+                        [Button.inline("📷 QR কোড দিয়ে কানেক্ট করুন", f"qr_login:{st['prof_key']}".encode())],
+                        [Button.inline("🔙 ড্যাশবোর্ড", f"home:{st['prof_key']}".encode())],
+                    ],
+                )
             return
 
         if st["step"] == "WAIT_OTP":
             # Allow typed code with separators/spaces like "1 2 3 4 5" or "12-345" as backup to numpad
             digits = re.sub(r"\D", "", raw_text)
-            if len(digits) == 5:
+            if 5 <= len(digits) <= 6 and pending_logins.get(event.sender_id) is st:
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
                 tmp = st["client"]
                 try:
                     await tmp.sign_in(phone=st["phone"], code=digits, phone_code_hash=st["hash"])
                     await complete_inbot_login(event.sender_id, st, event.chat_id)
                 except SessionPasswordNeededError:
                     st["step"] = "WAIT_2FA"
-                    await event.reply("🔒 আপনার অ্যাকাউন্টের <b>2FA পাসওয়ার্ড</b> লিখুন (পড়ার পর মেসেজটি ডিলিট করে দেওয়া হবে):")
+                    await bot_client.send_message(
+                        event.chat_id,
+                        "🔒 আপনার অ্যাকাউন্টের <b>2FA পাসওয়ার্ড</b> লিখুন (পড়ার পর মেসেজটি ডিলিট করে দেওয়া হবে):",
+                        buttons=[[Button.inline("❌ বাতিল", b"num:cancel")]],
+                    )
                 except Exception as e:
-                    await event.reply(f"❌ কোড সঠিক নয়: <code>{h(e)}</code>\nনিচের বাটনে কোডটি চাপুন।")
+                    await bot_client.send_message(event.chat_id, f"❌ কোড সঠিক নয়: <code>{h(e)}</code>\nনিচের বাটনে কোডটি চাপুন।")
             return
 
         if st["step"] == "WAIT_2FA":
@@ -2007,9 +2390,9 @@ async def start_health_server():
 
 async def main():
     cleanup_temp_dir()
-    print("=" * 60)
-    print("🚀 Telegram Multi-Account & Channel-Aware Forwarder Online")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("🚀 Telegram Multi-Account & Channel-Aware Forwarder Online")
+    logger.info("=" * 60)
 
     asyncio.create_task(start_health_server())
     asyncio.create_task(video_forward_worker())
@@ -2036,9 +2419,9 @@ async def main():
     # 3. Start Bot Client
     await bot_client.start(bot_token=BOT_TOKEN)
     me_bot = await bot_client.get_me()
-    print(f"✅ Bot Client Online: @{me_bot.username} (ID: {me_bot.id})")
-    print(f"👥 Connected Accounts: {len(user_clients)} | 🤖 Bot Known Chats: {len(app_state.get('bot_known_chats', {}))}")
-    print("=" * 60)
+    logger.info(f"✅ Bot Client Online: @{me_bot.username} (ID: {me_bot.id})")
+    logger.info(f"👥 Connected Accounts: {len(user_clients)} | 🤖 Bot Known Chats: {len(app_state.get('bot_known_chats', {}))}")
+    logger.info("=" * 60)
 
     await run_client_forever(bot_client, f"Bot:@{me_bot.username}")
 
