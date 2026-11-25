@@ -5,6 +5,8 @@ env/
 
 # Environment Variables & Credentials
 .env
+bot_state.json
+bot_state.json.tmp
 
 # Telethon session files
 *.session
