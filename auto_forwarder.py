@@ -316,6 +316,210 @@ restricted_source_chats: set[int] = set()
 # Per-account FloodWait unlock epoch timestamp & adaptive batch spacing delay
 account_flood_until: dict[int, float] = {}
 account_pace_delay: dict[int, float] = {}
+# Per-account structured rate limit history & active timers:
+# acc_id -> {bucket: {"bucket": str, "label": str, "reason": str, "detail": str, "total_seconds": int, "started_ts": float, "until_ts": float, "sticky": bool}}
+account_rate_limits: dict[int, dict[str, dict]] = {}
+
+_TELETHON_FLOOD_BUCKETS = {
+    functions.messages.CheckChatInviteRequest.CONSTRUCTOR_ID: (
+        "check_invite",
+        "প্রাইভেট ইনভাইট চেক",
+        "লিংক হান্টারে একটানা অনেকগুলো প্রাইভেট ইনভাইট (+...) চেক করায় টেলিগ্রাম ইনভাইট-চেক রেট-লিমিট দিয়েছে",
+    ),
+    functions.messages.ImportChatInviteRequest.CONSTRUCTOR_ID: (
+        "import_invite",
+        "প্রাইভেট গ্রুপে জয়েন",
+        "একটানা অনেকগুলো প্রাইভেট গ্রুপ/চ্যানেলে জয়েন করায় টেলিগ্রাম জয়েন রেট-লিমিট দিয়েছে",
+    ),
+    functions.contacts.ResolveUsernameRequest.CONSTRUCTOR_ID: (
+        "resolve_user",
+        "পাবলিক ইউজারনেম/লিংক খোঁজা",
+        "দ্রুত অনেক পাবলিক @username বা t.me লিংক যাচাই করায় টেলিগ্রাম ইউজারনেম-রিজলভ লিমিট দিয়েছে",
+    ),
+    functions.messages.ForwardMessagesRequest.CONSTRUCTOR_ID: (
+        "forward",
+        "ভিডিও ফরোয়ার্ড",
+        "একটানা দ্রুত অনেক ভিডিও ফরোয়ার্ড করায় টেলিগ্রাম স্প্যাম-গার্ড সাময়িক বিরতি দিয়েছে",
+    ),
+    functions.messages.SendMediaRequest.CONSTRUCTOR_ID: (
+        "upload",
+        "ভিডিও আপলোড",
+        "একটানা দ্রুত ভিডিও ফাইল আপলোড করায় টেলিগ্রাম মিডিয়া আপলোড লিমিট দিয়েছে",
+    ),
+    functions.messages.SearchRequest.CONSTRUCTOR_ID: (
+        "video_count",
+        "ভিডিও গণনা / সার্চ",
+        "দ্রুত অনেক গ্রুপের ভিডিও সংখ্যা সার্চ করায় টেলিগ্রাম সার্চ লিমিট দিয়েছে",
+    ),
+    functions.messages.GetHistoryRequest.CONSTRUCTOR_ID: (
+        "history_scan",
+        "মেসেজ হিস্টোরি স্ক্যান",
+        "দ্রুত অনেক মেসেজ হিস্টোরি স্ক্যান করায় টেলিগ্রাম হিস্টোরি লিমিট দিয়েছে",
+    ),
+}
+
+def _resolve_client_uid(client) -> int | None:
+    if client is None:
+        return None
+    for uid, uc in user_clients.items():
+        if uc is client:
+            return uid
+    return None
+
+def format_duration_bn(seconds: int) -> str:
+    secs = max(0, int(seconds))
+    hrs, rem = divmod(secs, 3600)
+    mins, s = divmod(rem, 60)
+    parts = []
+    if hrs:
+        parts.append(f"{hrs} ঘণ্টা")
+    if mins:
+        parts.append(f"{mins} মিনিট")
+    if s or not parts:
+        parts.append(f"{s} সেকেন্ড")
+    return " ".join(parts)
+
+def record_account_rate_limit(
+    acc_id: int | None,
+    bucket: str,
+    seconds: int,
+    label: str,
+    reason: str,
+    detail: str = "",
+    sticky: bool = False,
+):
+    key = acc_id if acc_id is not None else 0
+    now_ts = time.time()
+    dur = max(0, int(seconds))
+    entry = {
+        "bucket": bucket,
+        "label": label,
+        "reason": reason,
+        "detail": str(detail or "")[:80],
+        "total_seconds": dur,
+        "started_ts": now_ts,
+        "until_ts": (now_ts + dur) if (dur > 0 and not sticky) else (now_ts + 21600 if sticky else now_ts),
+        "sticky": sticky,
+    }
+    account_rate_limits.setdefault(key, {})[bucket] = entry
+
+def get_account_rate_limit_entries(acc_id: int | None) -> tuple[list[dict], list[dict]]:
+    """Returns (active_limits, recent_expired_limits) merging tracker history and live Telethon flood state."""
+    key = acc_id if acc_id is not None else 0
+    now_ts = time.time()
+    merged: dict[str, dict] = {k: dict(v) for k, v in account_rate_limits.get(key, {}).items()}
+
+    # Inspect Telethon client's live internal _flood_waited_requests cache too
+    uc = user_clients.get(acc_id) if acc_id else None
+    internal_floods = getattr(uc, "_flood_waited_requests", None) if uc else None
+    if isinstance(internal_floods, dict):
+        for cid, due_ts in list(internal_floods.items()):
+            rem = int(due_ts - now_ts)
+            if rem > 0 and cid in _TELETHON_FLOOD_BUCKETS:
+                b_key, b_label, b_reason = _TELETHON_FLOOD_BUCKETS[cid]
+                existing = merged.get(b_key)
+                if not existing or existing.get("until_ts", 0) < due_ts:
+                    merged[b_key] = {
+                        "bucket": b_key,
+                        "label": b_label,
+                        "reason": b_reason,
+                        "detail": existing.get("detail", "") if existing else "",
+                        "total_seconds": max(rem, existing.get("total_seconds", 0) if existing else rem),
+                        "started_ts": existing.get("started_ts", now_ts) if existing else now_ts,
+                        "until_ts": due_ts,
+                        "sticky": False,
+                    }
+
+    # Include legacy global forward lock if still active
+    fwd_until = account_flood_until.get(key, 0.0)
+    if fwd_until > now_ts and "forward" not in merged:
+        rem = int(fwd_until - now_ts)
+        merged["forward"] = {
+            "bucket": "forward",
+            "label": "ভিডিও ব্যাচ ফরোয়ার্ড",
+            "reason": "একটানা দ্রুত ফরোয়ার্ড করায় টেলিগ্রাম সাময়িক বিরতি দিয়েছে",
+            "detail": "",
+            "total_seconds": rem,
+            "started_ts": now_ts,
+            "until_ts": fwd_until,
+            "sticky": False,
+        }
+
+    active: list[dict] = []
+    expired: list[dict] = []
+    for item in merged.values():
+        until_ts = item.get("until_ts", 0.0)
+        rem = int(until_ts - now_ts)
+        if rem > 0:
+            item["remaining_seconds"] = rem
+            active.append(item)
+        elif now_ts - until_ts <= 43200:
+            item["remaining_seconds"] = 0
+            expired.append(item)
+
+    active.sort(key=lambda x: x["remaining_seconds"], reverse=True)
+    expired.sort(key=lambda x: x["started_ts"], reverse=True)
+    return active, expired[:5]
+
+def build_rate_limit_text_and_buttons(prof_key: str) -> tuple[str, list]:
+    profile = get_profile(prof_key)
+    acc_id = profile.get("active_account_id")
+    active, expired = get_account_rate_limit_entries(acc_id)
+    now_str = now_bst_str()
+
+    lines = [
+        f"⏳ <b>টেলিগ্রাম রেট-লিমিট স্ট্যাটাস</b>\n",
+        f"👤 <b>অ্যাকাউন্ট:</b> {get_account_badge(profile)}",
+        f"🕒 <b>বর্তমান সময়:</b> <code>{now_str}</code>\n",
+    ]
+
+    if active:
+        lines.append(f"🔴 <b>বর্তমানে <code>{len(active)}</code> টি সক্রিয় রেট-লিমিট চলছে:</b>\n")
+        for idx, item in enumerate(active, 1):
+            start_bst = datetime.fromtimestamp(item["started_ts"], tz=BST_TZ).strftime("%I:%M:%S %p")
+            if item.get("sticky"):
+                lines.append(
+                    f"{idx}. 🚫 <b>{h(item['label'])}</b>\n"
+                    f"• <b>সময়সীমা:</b> চ্যানেল সংখ্যা কমানো পর্যন্ত\n"
+                    f"• <b>কী জন্য দিছে:</b> {h(item['reason'])}\n"
+                    f"• <b>সনাক্তের সময়:</b> <code>{start_bst}</code>"
+                )
+            else:
+                unlock_bst = datetime.fromtimestamp(item["until_ts"], tz=BST_TZ).strftime("%I:%M:%S %p")
+                total_txt = format_duration_bn(item.get("total_seconds", item["remaining_seconds"]))
+                rem_txt = format_duration_bn(item["remaining_seconds"])
+                det = f"\n• <b>লিংক/গ্রুপ:</b> <code>{h(item['detail'])}</code>" if item.get("detail") else ""
+                lines.append(
+                    f"{idx}. ⏳ <b>{h(item['label'])}</b>\n"
+                    f"• <b>কতোক্ষন দিছে (মোট):</b> <code>{total_txt}</code>\n"
+                    f"• <b>থাকবে কতোক্ষন (বাকি):</b> <code>{rem_txt}</code> (খুলবে: <b>{unlock_bst}</b>)\n"
+                    f"• <b>শুরু হয়েছিল:</b> <code>{start_bst}</code>\n"
+                    f"• <b>কী জন্য দিছে:</b> {h(item['reason'])}{det}"
+                )
+    else:
+        lines.append(
+            "🟢 <b>বর্তমানে এই অ্যাকাউন্টে কোনো সক্রিয় রেট-লিমিট নেই!</b>\n"
+            "আপনি এখন স্বাভাবিকভাবে ফরোয়ার্ড, গ্রুপ স্ক্যান এবং লিংক খুজা চালাতে পারবেন।"
+        )
+
+    if acc_id and acc_id in account_pace_delay:
+        lines.append(f"\n⚡ <b>বর্তমান নিরাপদ ব্যাচ বিরতি:</b> <code>{account_pace_delay[acc_id]:.1f}s</code>")
+
+    if expired:
+        lines.append("\n📜 <b>সাম্প্রতিক শেষ হওয়া রেট-লিমিটসমূহ:</b>")
+        for item in expired[:3]:
+            st_bst = datetime.fromtimestamp(item["started_ts"], tz=BST_TZ).strftime("%I:%M %p")
+            tot_txt = format_duration_bn(item.get("total_seconds", 0))
+            lines.append(
+                f"• ✅ <b>{h(item['label'])}</b> (<code>{tot_txt}</code>, {st_bst}) — {h(item['reason'])}"
+            )
+
+    btns = [
+        [Button.inline("🔄 সময় রিফ্রেশ করুন", f"rl:{prof_key}".encode())],
+        [Button.inline("👤 অন্য অ্যাকাউন্ট নির্বাচন / সুইচ", f"acc:{prof_key}".encode())],
+        [Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())],
+    ]
+    return "\n".join(lines), btns
 
 async def wait_out_flood(
     acc_id: int | None,
@@ -326,13 +530,18 @@ async def wait_out_flood(
     prof_key: str = "",
     copied: int = 0,
     should_stop_fn=None,
+    bucket: str = "forward",
+    label: str = "ভিডিও ব্যাচ ফরোয়ার্ড",
+    reason: str = "একটানা দ্রুত অনেক ভিডিও ফরোয়ার্ড করায় টেলিগ্রাম স্প্যাম-গার্ড সাময়িক বিরতি দিয়েছে",
+    detail: str = "",
 ):
     """
     Waits out Telegram FloodWait safely in cancelable 2s steps, bumps adaptive pacing,
-    and updates the Telegram UI live with exact Bangladesh unlock clock & switch-account button.
+    records exact rate-limit duration/expiry/reason, and updates UI live.
     """
     now_ts = time.time()
     target_ts = now_ts + max(1, seconds) + 2
+    record_account_rate_limit(acc_id, bucket, seconds, label, reason, detail=detail)
     if acc_id:
         account_flood_until[acc_id] = max(account_flood_until.get(acc_id, 0.0), target_ts)
         cur_pace = account_pace_delay.get(acc_id, 1.5)
@@ -1043,10 +1252,17 @@ async def upload_file_with_retry(
             return await upload_client.send_file(**kwargs)
         except FloodWaitError as flood:
             logger.warning(f"SendMedia FloodWait ({flood.seconds}s): pausing before retry...")
+            record_account_rate_limit(
+                _resolve_client_uid(upload_client),
+                "upload",
+                flood.seconds,
+                "ভিডিও আপলোড",
+                "দ্রুত একটানা ভিডিও ফাইল আপলোড করায় টেলিগ্রাম মিডিয়া আপলোড লিমিট দিয়েছে",
+            )
             if flood_cb:
                 await flood_cb(flood.seconds)
             else:
-                await wait_out_flood(None, flood.seconds)
+                await wait_out_flood(_resolve_client_uid(upload_client), flood.seconds, bucket="upload", label="ভিডিও আপলোড", reason="দ্রুত একটানা ভিডিও ফাইল আপলোড করায় টেলিগ্রাম মিডিয়া আপলোড লিমিট দিয়েছে")
             if attempt == 3:
                 raise
     return None
@@ -1510,6 +1726,14 @@ async def resilient_iter_messages(
             break
         except FloodWaitError as fl:
             wait_s = min(fl.seconds + 2, 120)
+            record_account_rate_limit(
+                _resolve_client_uid(client),
+                "history_scan",
+                fl.seconds,
+                "মেসেজ হিস্টোরি স্ক্যান",
+                "বড় গ্রুপের মেসেজ হিস্টোরি দ্রুত স্ক্যান করায় টেলিগ্রাম হিস্টোরি লিমিট দিয়েছে",
+                detail=label,
+            )
             logger.warning(f"History scan FloodWait ({fl.seconds}s) on {label} at id={last_id}: sleeping {wait_s}s...")
             await asyncio.sleep(wait_s)
             retries += 1
@@ -1635,6 +1859,14 @@ async def _batch_forward_unrestricted(
                     cur_p = account_pace_delay.get(acc_id, 1.5)
                     new_p = min(max(cur_p * 1.4, 2.8), 6.0)
                     account_pace_delay[acc_id] = new_p
+                    record_account_rate_limit(
+                        acc_id,
+                        "forward",
+                        int(elapsed),
+                        "ভিডিও ফরোয়ার্ড (অটো-পজ)",
+                        "একটানা দ্রুত ফরোয়ার্ড করায় টেলিগ্রাম অটো সাময়িক পজ দিয়েছিল",
+                        detail=s_title,
+                    )
                     logger.info(f"⚠️ Internal Telegram flood pause detected ({elapsed:.1f}s); raising batch pace to {new_p:.1f}s")
                     await asyncio.sleep(2.5)
                 return True, False, False
@@ -1644,6 +1876,14 @@ async def _batch_forward_unrestricted(
                 return False, True, False
             except FloodWaitError as fl:
                 logger.warning(f"Batch Forward FloodWait ({fl.seconds}s) on [{acc_id}] -> handling cleanly")
+                record_account_rate_limit(
+                    acc_id,
+                    "forward",
+                    fl.seconds,
+                    "ভিডিও ব্যাচ ফরোয়ার্ড",
+                    "একটানা দ্রুত অনেক ভিডিও ফরোয়ার্ড করায় টেলিগ্রাম স্প্যাম-গার্ড বিরতি দিয়েছে",
+                    detail=s_title,
+                )
                 await handle_wait(fl.seconds)
                 if should_stop_fn and should_stop_fn():
                     return False, False, True
@@ -2476,6 +2716,7 @@ async def send_link_hunt_report(
 
     nav_buttons = [
         [Button.inline("🔍 আরেকটি গ্রুপে খুঁজুন", f"hunt:{prof_key}".encode())],
+        [Button.inline("⏳ রেট-লিমিট স্ট্যাটাস ও কারণ দেখুন", f"rl:{prof_key}".encode())],
         [Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())],
     ]
 
@@ -2584,6 +2825,14 @@ async def _iter_hunt_messages_desc(
                 break
             except FloodWaitError as fl:
                 wait_s = min(fl.seconds + 2, 120)
+                record_account_rate_limit(
+                    _resolve_client_uid(uc),
+                    "history_scan",
+                    fl.seconds,
+                    "মেসেজ হিস্টোরি স্ক্যান",
+                    "গ্রুপের অনেক মেসেজ দ্রুত স্ক্যান করায় টেলিগ্রাম হিস্টোরি রেট-লিমিট দিয়েছে",
+                    detail=label,
+                )
                 logger.warning(f"Hunt history FloodWait ({fl.seconds}s) on {label} (phase={phase}): sleeping {wait_s}s...")
                 await asyncio.sleep(wait_s)
                 retries += 1
@@ -2635,11 +2884,22 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
         try:
             start_ent, start_joined, note = await resolve_chat_link_for_hunt(uc, target_input, allow_join=True, acc_id=acc_id)
         except FloodWaitError as fl:
+            record_account_rate_limit(
+                acc_id,
+                "check_invite" if getattr(fl, "_from_check_invite", False) else "resolve_user",
+                fl.seconds,
+                "মূল গ্রুপ লিংক যাচাই",
+                "একটানা অনেক লিংক/গ্রুপ যাচাই করায় টেলিগ্রাম মূল গ্রুপ খুলতে সাময়িক রেট-লিমিট দিয়েছে",
+                detail=str(target_input),
+            )
             await bot_client.edit_message(
                 reply_chat_id,
                 status_msg_id,
-                f"⏳ টেলিগ্রাম রেট-লিমিটের কারণে এখন এই লিংকটি খোলা যাচ্ছে না ({fl.seconds} সেকেন্ড বিরতি)।",
-                buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]],
+                f"⏳ টেলিগ্রাম রেট-লিমিটের কারণে এখন এই লিংকটি খোলা যাচ্ছে না (<b>{h(format_duration_bn(fl.seconds))}</b> বিরতি)।",
+                buttons=[
+                    [Button.inline("⏳ রেট-লিমিট স্ট্যাটাস ও কারণ দেখুন", f"rl:{prof_key}".encode())],
+                    [Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())],
+                ],
             )
             return
 
@@ -2768,6 +3028,32 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                         )
                         break
                     except FloodWaitError as fl:
+                        if is_invite and getattr(fl, "_from_check_invite", False):
+                            rl_b, rl_lbl, rl_rsn = (
+                                "check_invite",
+                                "প্রাইভেট ইনভাইট চেক",
+                                "অনেকগুলো প্রাইভেট ইনভাইট (+...) একসাথে যাচাই করায় টেলিগ্রাম ইনভাইট-চেক লিমিট দিয়েছে",
+                            )
+                        elif is_invite:
+                            rl_b, rl_lbl, rl_rsn = (
+                                "import_invite",
+                                "প্রাইভেট গ্রুপে জয়েন",
+                                "একটানা অনেকগুলো প্রাইভেট গ্রুপ/চ্যানেলে জয়েন করায় টেলিগ্রাম জয়েন রেট-লিমিট দিয়েছে",
+                            )
+                        elif ck.startswith("user:"):
+                            rl_b, rl_lbl, rl_rsn = (
+                                "resolve_user",
+                                "পাবলিক ইউজারনেম/লিংক খোঁজা",
+                                "দ্রুত অনেক পাবলিক @username বা t.me লিংক যাচাই করায় টেলিগ্রাম রিজলভ লিমিট দিয়েছে",
+                            )
+                        else:
+                            rl_b, rl_lbl, rl_rsn = (
+                                "resolve_chat",
+                                "গ্রুপ লিংক যাচাই",
+                                "দ্রুত অনেক গ্রুপ লিংক যাচাই করায় টেলিগ্রাম রেট-লিমিট দিয়েছে",
+                            )
+                        record_account_rate_limit(acc_id, rl_b, fl.seconds, rl_lbl, rl_rsn, detail=disp_url)
+
                         if fl.seconds > 240:
                             if is_invite:
                                 private_join_blocked = True
@@ -2801,6 +3087,15 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 if status_note == "too_many_channels":
                     private_join_blocked = True
                     partial_note = "চ্যানেল জয়েন লিমিট পূর্ণ হওয়ায় নতুন প্রাইভেট লিংক জয়েন বাদ পড়েছে"
+                    record_account_rate_limit(
+                        acc_id,
+                        "too_many_channels",
+                        0,
+                        "সর্বোচ্চ চ্যানেল জয়েন সীমা (~৫০০)",
+                        "আপনার অ্যাকাউন্টে সর্বোচ্চ সংখ্যক চ্যানেল/গ্রুপ জয়েন পূর্ণ হয়ে গেছে; পুরনো অপ্রয়োজনীয় গ্রুপ লিভ করলে নতুন প্রাইভেট গ্রুপে জয়েন হবে",
+                        detail=disp_url,
+                        sticky=True,
+                    )
                     skipped_err += 1
                     continue
                 if not ent:
@@ -2818,6 +3113,14 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 try:
                     vid_total = await count_real_videos_in_chat(uc, ent)
                 except FloodWaitError as fl:
+                    record_account_rate_limit(
+                        acc_id,
+                        "video_count",
+                        fl.seconds,
+                        "ভিডিও সংখ্যা গণনা",
+                        "অনেক গ্রুপের ভিডিও সংখ্যা দ্রুত সার্চ করায় টেলিগ্রাম সার্চ রেট-লিমিট দিয়েছে",
+                        detail=disp_url,
+                    )
                     if fl.seconds > 240:
                         stop_reason = f"টেলিগ্রাম লিমিটের ({fl.seconds}s) কারণে বিরতি"
                         break
@@ -3052,6 +3355,12 @@ def get_main_menu_buttons(prof_key: str, is_private: bool = True):
             Button.inline("🔄 ৫০০টি সিঙ্ক", f"sync:{prof_key}:500".encode()),
         ],
         [Button.inline("🔍 লিংক খুজা", f"hunt:{prof_key}".encode())],
+        [Button.inline(
+            f"⏳ রেট-লিমিট ({len(get_account_rate_limit_entries(acc_id)[0])}টি সক্রিয় 🔴)"
+            if get_account_rate_limit_entries(acc_id)[0]
+            else "⏳ রেট-লিমিট স্ট্যাটাস",
+            f"rl:{prof_key}".encode(),
+        )],
         [
             Button.inline("👤 অ্যাকাউন্ট ম্যানেজার", f"acc:{prof_key}".encode()),
             Button.inline("⚙️ সেটিংস ও অপশন", f"cfg:{prof_key}".encode()),
@@ -3522,6 +3831,7 @@ async def render_account_manager(event, prof_key: str):
     else:
         buttons.append([Button.url("📲 ইনবক্সে নতুন অ্যাকাউন্ট কানেক্ট করুন", "https://t.me/autforwbdbot?start=login")])
 
+    buttons.append([Button.inline("⏳ রেট-লিমিট স্ট্যাটাস", f"rl:{prof_key}".encode())])
     buttons.append([Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())])
 
     await safe_edit_message(
@@ -3700,6 +4010,14 @@ async def bot_findlinks_cmd_handler(event):
     sender_id = getattr(event, "sender_id", None) or event.chat_id
     await prompt_link_hunt(event.reply, sender_id, prof_key)
 
+@bot_client.on(events.NewMessage(pattern=r"^/(limit|ratelimit|flood)(?:@autforwbdbot)?$"))
+async def bot_ratelimit_cmd_handler(event):
+    if event.out or not await is_operator_authorized(event):
+        return
+    prof_key, _ = await resolve_profile_key_from_chat(event)
+    txt, btns = build_rate_limit_text_and_buttons(prof_key)
+    await event.reply(txt, buttons=btns)
+
 # ==================== BOT CALLBACK HANDLER ====================
 
 @bot_client.on(events.CallbackQuery)
@@ -3834,6 +4152,13 @@ async def bot_callback_handler(event):
         pending_link_hunts.pop(cb_uid, None)
         await event.answer()
         await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
+        return
+
+    if cmd == "rl":
+        txt, btns = build_rate_limit_text_and_buttons(prof_key)
+        active_cnt = len(get_account_rate_limit_entries(profile.get("active_account_id"))[0])
+        await event.answer(f"⏳ {active_cnt}টি সক্রিয় রেট-লিমিট" if active_cnt else "🟢 কোনো সক্রিয় লিমিট নেই", alert=False)
+        await safe_edit_message(event, txt, buttons=btns)
         return
 
     if cmd in ("hunt", "hl", "h_scan"):
