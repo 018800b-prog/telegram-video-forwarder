@@ -38,6 +38,7 @@ import asyncio
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from urllib.parse import unquote
 
 try:
     import qrcode
@@ -2211,32 +2212,40 @@ def _normalize_telegram_candidate(raw_token: str, is_at_username: bool = False) 
         return None
     return f"user:{low}", f"https://t.me/{uname}"
 
-def _extract_links_from_blobs(texts: list[str]) -> list[tuple[str, str]]:
+def _scan_links_in_blobs(texts: list[str]) -> tuple[list[tuple[str, str]], int]:
+    """Extracts unique (canon_key, display_url) pairs and counts total raw Telegram group/channel link occurrences."""
     seen: dict[str, str] = {}
+    raw_hits = 0
+    patterns = (
+        (_TME_LINK_RE, False, ""),
+        (_TG_DEEP_INV_RE, False, "+"),
+        (_TG_DEEP_USER_RE, True, ""),
+        (_AT_USER_RE, True, ""),
+    )
     for raw_blob in texts:
         blob = _ZW_RE.sub("", raw_blob or "")
         if not blob:
             continue
-        for m in _TME_LINK_RE.finditer(blob):
-            norm = _normalize_telegram_candidate(m.group(1), is_at_username=False)
-            if norm and norm[0] not in seen:
-                seen[norm[0]] = norm[1]
-        for m in _TG_DEEP_INV_RE.finditer(blob):
-            norm = _normalize_telegram_candidate("+" + m.group(1), is_at_username=False)
-            if norm and norm[0] not in seen:
-                seen[norm[0]] = norm[1]
-        for m in _TG_DEEP_USER_RE.finditer(blob):
-            norm = _normalize_telegram_candidate(m.group(1), is_at_username=True)
-            if norm and norm[0] not in seen:
-                seen[norm[0]] = norm[1]
-        for m in _AT_USER_RE.finditer(blob):
-            norm = _normalize_telegram_candidate(m.group(1), is_at_username=True)
-            if norm and norm[0] not in seen:
-                seen[norm[0]] = norm[1]
-    return list(seen.items())
+        variants = [blob] if "%" not in blob else [blob, unquote(blob)]
+        msg_seen_in_blob: set[str] = set()
+        for v_idx, txt in enumerate(variants):
+            for pat, is_at, prefix in patterns:
+                for m in pat.finditer(txt):
+                    norm = _normalize_telegram_candidate(prefix + m.group(1), is_at_username=is_at)
+                    if not norm:
+                        continue
+                    if v_idx == 0 or norm[0] not in msg_seen_in_blob:
+                        raw_hits += 1
+                        msg_seen_in_blob.add(norm[0])
+                    if norm[0] not in seen:
+                        seen[norm[0]] = norm[1]
+    return list(seen.items()), raw_hits
 
-def extract_telegram_links_from_message(message) -> list[tuple[str, str]]:
-    """Extracts deduplicated Telegram group/channel (canon_key, display_url) pairs from text, entities & buttons."""
+def _extract_links_from_blobs(texts: list[str]) -> list[tuple[str, str]]:
+    items, _ = _scan_links_in_blobs(texts)
+    return items
+
+def _message_text_blobs(message) -> list[str]:
     if not message:
         return []
     texts: list[str] = []
@@ -2259,12 +2268,15 @@ def extract_telegram_links_from_message(message) -> list[tuple[str, str]]:
 
     wp = getattr(getattr(message, "media", None), "webpage", None)
     if wp:
-        if getattr(wp, "url", None):
-            texts.append(wp.url)
-        if getattr(wp, "description", None):
-            texts.append(wp.description)
+        for field in ("url", "title", "description"):
+            val = getattr(wp, field, None)
+            if val:
+                texts.append(val)
+    return texts
 
-    return _extract_links_from_blobs(texts)
+def extract_telegram_links_from_message(message) -> list[tuple[str, str]]:
+    """Extracts deduplicated Telegram group/channel (canon_key, display_url) pairs from text, entities, buttons & previews."""
+    return _extract_links_from_blobs(_message_text_blobs(message))
 
 def get_active_hunt(prof_key: str) -> dict:
     prof_key = str(prof_key)
@@ -2332,7 +2344,11 @@ async def resolve_chat_link_for_hunt(
     try:
         if canon_key.startswith("inv:"):
             invite_hash = canon_key.split(":", 1)[1]
-            chk = await uc(functions.messages.CheckChatInviteRequest(invite_hash))
+            try:
+                chk = await uc(functions.messages.CheckChatInviteRequest(invite_hash))
+            except FloodWaitError as fl:
+                setattr(fl, "_from_check_invite", True)
+                raise
             if isinstance(chk, (types.ChatInviteAlready, types.ChatInvitePeek)):
                 ent = getattr(chk, "chat", None)
             elif isinstance(chk, types.ChatInvite):
@@ -2444,16 +2460,18 @@ async def send_link_hunt_report(
     skipped_under: int,
     skipped_err: int,
     stop_reason: str = "",
+    raw_links: int = 0,
 ):
     matches_sorted = sorted(matches, key=lambda x: x["videos"], reverse=True)
-    header_tag = "✅ <b>লিংক খুঁজা রিপোর্ট সম্পন্ন!</b>" if not stop_reason else f"⚠️ <b>লিংক খুঁজা {stop_reason}</b>"
+    header_tag = "✅ <b>লিংক খুঁজা রিপোর্ট সম্পন্ন!</b>" if not stop_reason else f"⚠️ <b>লিংক খুঁজা ({stop_reason})</b>"
+    raw_info = f" (মোট পোস্টে: <code>{raw_links}</code> টি)" if raw_links > total_links else ""
     summary = (
         f"{header_tag}\n\n"
         f"📂 <b>মূল গ্রুপ:</b> {h(start_title)}\n"
-        f"🔗 <b>মোট ইউনিক লিংক পাওয়া গেছে:</b> <code>{total_links}</code> টি\n"
-        f"🔎 <b>যাচাই করা হয়েছে:</b> <code>{checked_count}</code> টি\n"
+        f"🔗 <b>ইউনিক গ্রুপ/চ্যানেল লিংক:</b> <code>{total_links}</code> টি{raw_info}\n"
+        f"🔎 <b>চেক করা হয়েছে:</b> <code>{checked_count}</code> টি\n"
         f"🎬 <b>{HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত লিংক:</b> <code>{len(matches_sorted)}</code> টি\n"
-        f"♻️ <b>{HUNT_MIN_VIDEOS}-এর কম / অকার্যকর বাদ:</b> <code>{skipped_under + skipped_err}</code> টি"
+        f"📉 <b>{HUNT_MIN_VIDEOS}-এর কম ভিডিও:</b> <code>{skipped_under}</code> টি | 🚫 <b>অকার্যকর/লিমিট/ডুপ্লিকেট:</b> <code>{skipped_err}</code> টি"
     )
 
     nav_buttons = [
@@ -2656,6 +2674,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
 
         # Step 2: Scan messages newest -> oldest cleanly so ALL links across history are collected
         scanned_msgs = 0
+        raw_links_total = 0
         last_edit = 0.0
         async for m in _iter_hunt_messages_desc(
             uc,
@@ -2668,7 +2687,9 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 stop_reason = "ব্যবহারকারী থামিয়েছেন"
                 break
             scanned_msgs += 1
-            for ck, disp in extract_telegram_links_from_message(m):
+            msg_items, msg_raw_hits = _scan_links_in_blobs(_message_text_blobs(m))
+            raw_links_total += msg_raw_hits
+            for ck, disp in msg_items:
                 if ck not in discovered:
                     discovered[ck] = disp
 
@@ -2682,7 +2703,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                         f"🔍 <b>গ্রুপ থেকে সব লিংক খোঁজা হচ্ছে...</b>\n\n"
                         f"📂 <b>গ্রুপ:</b> {h(start_title)}\n"
                         f"🔎 স্ক্যান করা মেসেজ: <code>{scanned_msgs}</code> টি\n"
-                        f"🔗 পাওয়া ইউনিক লিংক: <code>{len(discovered)}</code> টি",
+                        f"🔗 মোট লিংক: <code>{raw_links_total}</code> টি | ইউনিক: <code>{len(discovered)}</code> টি",
                         buttons=[[Button.inline("🛑 থামান", f"hs:{prof_key}".encode())]],
                     )
                 except Exception:
@@ -2695,20 +2716,21 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
         link_items = public_items + invite_items
         logger.info(
             f"🔎 [LinkHunter:{prof_key}] Start={start_title!r}: scanned={scanned_msgs} msgs, "
-            f"unique_links={len(link_items)} (public/cid={len(public_items)}, invite={len(invite_items)})"
+            f"raw_links={raw_links_total}, unique_links={len(link_items)} (public/cid={len(public_items)}, invite={len(invite_items)})"
         )
 
         if not link_items:
-            await send_link_hunt_report(reply_chat_id, status_msg_id, prof_key, start_title, 0, 0, [], 0, 0, stop_reason)
+            await send_link_hunt_report(reply_chat_id, status_msg_id, prof_key, start_title, 0, 0, [], 0, 0, stop_reason, raw_links=raw_links_total)
             return
 
         try:
             await bot_client.edit_message(
                 reply_chat_id,
                 status_msg_id,
-                f"🔎 <b>মোট <code>{len(link_items)}</code> টি ইউনিক লিংক পাওয়া গেছে!</b>\n\n"
+                f"🔎 <b>স্ক্যান সম্পন্ন: <code>{scanned_msgs}</code> টি মেসেজে <code>{raw_links_total}</code> টি লিংক (ইউনিক: <code>{len(link_items)}</code> টি)!</b>\n\n"
                 f"📂 <b>মূল গ্রুপ:</b> {h(start_title)}\n"
-                f"🎬 এখন প্রতিটি লিংক ১টি করে চেক করে {HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত গ্রুপ আলাদা করা হচ্ছে...",
+                f"🌐 পাবলিক: <code>{len(public_items)}</code> টি | 🔒 প্রাইভেট ইনভাইট: <code>{len(invite_items)}</code> টি\n"
+                f"🎬 এখন প্রতিটি চেক করে {HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত গ্রুপ আলাদা করা হচ্ছে...",
                 buttons=[[Button.inline("🛑 থামান ও এখনকার রিপোর্ট দেখুন", f"hs:{prof_key}".encode())]],
             )
         except Exception:
@@ -2717,6 +2739,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
         # Step 3: Verify every single link 1-by-1 cleanly, checking >= 50 videos
         seen_peer_canons: set[int] = {start_canon}
         private_join_blocked = False
+        invite_check_blocked = False
         last_edit = time.monotonic()
 
         for idx, (ck, disp_url) in enumerate(link_items, 1):
@@ -2730,6 +2753,13 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
             vid_total = 0
             status_note = "error"
             is_invite = ck.startswith("inv:")
+
+            # If Telegram already placed a long cooldown on CheckChatInviteRequest, skip remaining inv: without log storm
+            if is_invite and invite_check_blocked:
+                checked_count += 1
+                skipped_err += 1
+                continue
+
             try:
                 for attempt in range(2):
                     try:
@@ -2738,12 +2768,14 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                         )
                         break
                     except FloodWaitError as fl:
-                        if fl.seconds > 120:
+                        if fl.seconds > 240:
                             if is_invite:
-                                # Private invite hit long flood -> skip remaining fresh joins, keep checking other links!
                                 private_join_blocked = True
-                                partial_note = f"প্রাইভেট জয়েন লিমিট ({fl.seconds}s)-এর কারণে অজয়েন করা কিছু প্রাইভেট ইনভাইট বাদ পড়েছে"
-                                logger.warning(f"🔎 [LinkHunter:{prof_key}] Invite FloodWait ({fl.seconds}s) -> continuing remaining non-join checks")
+                                if getattr(fl, "_from_check_invite", False):
+                                    invite_check_blocked = True
+                                mins_w = max(1, fl.seconds // 60)
+                                partial_note = f"টেলিগ্রাম প্রাইভেট লিংক লিমিট (~{mins_w} মিনিট) থাকায় অজয়েন করা প্রাইভেট ইনভাইট বাদ পড়েছে"
+                                logger.warning(f"🔎 [LinkHunter:{prof_key}] Invite FloodWait ({fl.seconds}s, check_blocked={invite_check_blocked}) -> skipping remaining unjoined invites")
                                 status_note = "invite_flood"
                                 ent = None
                                 break
@@ -2786,7 +2818,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 try:
                     vid_total = await count_real_videos_in_chat(uc, ent)
                 except FloodWaitError as fl:
-                    if fl.seconds > 120:
+                    if fl.seconds > 240:
                         stop_reason = f"টেলিগ্রাম লিমিটের ({fl.seconds}s) কারণে বিরতি"
                         break
                     await bot_client.edit_message(
@@ -2827,7 +2859,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                         status_msg_id,
                         f"🔎 <b>লিংক যাচাই চলছে...</b>\n\n"
                         f"📂 <b>মূল গ্রুপ:</b> {h(start_title)}\n"
-                        f"🔗 <b>পাওয়া মোট লিংক:</b> <code>{len(link_items)}</code> টি\n"
+                        f"🔗 <b>ইউনিক লিংক:</b> <code>{len(link_items)}</code> টি (মোট: <code>{raw_links_total}</code>)\n"
                         f"📊 <b>চেক সম্পন্ন:</b> <code>{idx}/{len(link_items)}</code> টি\n"
                         f"✅ <b>{HUNT_MIN_VIDEOS}+ ভিডিও মিলেছে:</b> <code>{len(matches)}</code> টি\n"
                         f"♻️ <b>বাদ পড়েছে:</b> <code>{skipped_under + skipped_err}</code> টি",
@@ -2843,7 +2875,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
         )
         await send_link_hunt_report(
             reply_chat_id, status_msg_id, prof_key, start_title,
-            len(link_items), checked_count, matches, skipped_under, skipped_err, final_note
+            len(link_items), checked_count, matches, skipped_under, skipped_err, final_note, raw_links=raw_links_total
         )
     except asyncio.CancelledError:
         hunt_state["should_stop"] = True
@@ -3401,19 +3433,11 @@ async def start_inbot_login_prompt(reply_fn, sender_id: int, prof_key: str):
         "📲 <b>আপনার টেলিগ্রাম অ্যাকাউন্ট কানেক্ট করুন</b>\n\n"
         "এই অ্যাকাউন্টের সকল প্রাইভেট ও পাবলিক গ্রুপ স্ক্যান করতে যেকোনো ১টি সহজ পদ্ধতি বেছে নিন:\n\n"
         "🥇 <b>সবচেয়ে সহজ (কোড ছাড়াই):</b> নিচের <b>📷 QR কোড দিয়ে কানেক্ট</b> বাটনে চাপুন।\n"
-        "🥈 <b>ফোন নম্বর দিয়ে:</b> নিচের <b>📱 আমার ফোন নম্বর দিন</b> বাটনে চাপুন বা দেশ কোডসহ নম্বর লিখুন (<code>+88017xxxxxxxx</code>)।\n"
+        "🥈 <b>ফোন নম্বর দিয়ে:</b> দেশ কোডসহ আপনার নম্বরটি চ্যাটে লিখে পাঠান (<code>+88017xxxxxxxx</code>)।\n"
         "🥉 <b>সেশন স্ট্রিং:</b> পিসি (<code>login.bat</code>) থেকে তৈরি Session String সরাসরি এখানে পেস্ট করতে পারেন।",
         buttons=[
             [Button.inline("📷 QR কোড দিয়ে কানেক্ট (সবচেয়ে সহজ, কোড লাগবে না)", f"qr_login:{prof_key}".encode())],
             [Button.inline("❌ বাতিল", b"num:cancel")],
-        ],
-    )
-    await bot_client.send_message(
-        sender_id,
-        "👇 ফোন নম্বর শেয়ার করতে চাইলে নিচের বোতামে চাপুন অথবা নম্বর লিখুন:",
-        buttons=[
-            [Button.request_phone("📱 আমার ফোন নম্বর দিন", resize=True, single_use=True)],
-            [Button.text("❌ বাতিল করুন", resize=True)],
         ],
     )
 
@@ -3452,10 +3476,19 @@ async def complete_inbot_login(uid: int, state_data: dict, reply_target):
     pending_logins.pop(uid, None)
     items, scan_time = await scan_account_dialogs(new_uid, force_refresh=True)
 
+    # Clear any legacy sticky bottom ReplyKeyboard (phone/cancel bar) permanently on login completion
+    try:
+        await bot_client.send_message(
+            reply_target,
+            f"🎉 <b>অভিনন্দন! আপনার অ্যাকাউন্ট কানেক্ট হয়েছে!</b>\n"
+            f"👤 <b>নাম:</b> {h(full_name)} (<code>{new_uid}</code>)",
+            buttons=Button.clear(),
+        )
+    except Exception:
+        pass
+
     await bot_client.send_message(
         reply_target,
-        f"🎉 <b>অভিনন্দন! আপনার অ্যাকাউন্ট কানেক্ট হয়েছে!</b>\n\n"
-        f"👤 <b>নাম:</b> {h(full_name)} (<code>{new_uid}</code>)\n"
         f"📊 <b>মোট গ্রুপ/চ্যানেল পাওয়া গেছে:</b> <code>{len(items)}</code> টি\n\n"
         f"এখন নিচের বাটনে চাপ দিয়ে আপনার সোর্স ও টার্গেট গ্রুপ নির্বাচন করুন:",
         buttons=[
@@ -3563,6 +3596,13 @@ async def bot_start_handler(event):
         )
         return
 
+    if event.is_private:
+        try:
+            clr_msg = await event.respond("🔄 ড্যাশবোর্ড প্রস্তুত হচ্ছে...", buttons=Button.clear())
+            await asyncio.sleep(0.25)
+            await clr_msg.delete()
+        except Exception:
+            pass
     await event.reply(get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=True))
 
 @bot_client.on(events.NewMessage(pattern=r"^/scan(?:@autforwbdbot)?$"))
@@ -3685,6 +3725,12 @@ async def bot_callback_handler(event):
             prof_k = st.get("prof_key", str(event.chat_id)) if st else str(event.chat_id)
             pending_logins.pop(uid, None)
             await event.answer("❌ বাতিল করা হয়েছে", alert=False)
+            try:
+                clr_msg = await bot_client.send_message(event.chat_id, "❌ বাতিল করা হয়েছে।", buttons=Button.clear())
+                await asyncio.sleep(0.2)
+                await clr_msg.delete()
+            except Exception:
+                pass
             await safe_edit_message(event, "❌ অ্যাকাউন্ট লগইন বাতিল করা হয়েছে।", buttons=[[Button.inline("🔙 ড্যাশবোর্ড", f"home:{prof_k}".encode())]])
             return
 
