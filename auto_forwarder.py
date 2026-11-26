@@ -303,6 +303,9 @@ entity_caches: dict[tuple, object] = {}
 bot_scan_meta = {"last_scan": now_bst_str()}
 # Pending in-bot login states: sender_id (int) -> dict
 pending_logins: dict[int, dict] = {}
+# Pending & active Link Hunter scans
+pending_link_hunts: dict[int, dict] = {}
+active_link_hunts: dict[str, dict] = {}
 # Per-profile active bulk sync tracking
 active_syncs: dict[str, dict] = {}
 # Deduplicate dual delivery when both Userbot & Bot see the same source post
@@ -2147,6 +2150,602 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
         sync_state["running"] = False
         sync_state["task"] = None
 
+# ==================== LINK HUNTER (100+ VIDEO GROUP FINDER) ====================
+
+HUNT_MIN_VIDEOS = 100  # Strictly > 100 videos required
+_RESERVED_TME_PATHS = {
+    "addstickers", "addemoji", "addtheme", "share", "proxy", "socks", "iv",
+    "setlanguage", "bg", "boost", "joinchat", "c", "s", "nft", "giftcode",
+    "invoice", "login", "confirm", "contact", "botfather", "spambot", "telegram",
+}
+_TME_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(?:s/)?"
+    r"(\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|c/\d+(?:/\d+)?|[A-Za-z][A-Za-z0-9_]{3,31}(?:/\d+)?)",
+    re.IGNORECASE,
+)
+_AT_USER_RE = re.compile(r"(?<![A-Za-z0-9_.])@([A-Za-z][A-Za-z0-9_]{3,31})")
+
+def _normalize_telegram_candidate(raw_token: str, is_at_username: bool = False) -> tuple[str, str] | None:
+    tok = raw_token.strip().rstrip(".,;:!?)\"'<>")
+    if not tok:
+        return None
+    if is_at_username:
+        uname = tok.lstrip("@")
+        low = uname.lower()
+        if low in _RESERVED_TME_PATHS or low.endswith("bot"):
+            return None
+        return f"user:{low}", f"https://t.me/{uname}"
+
+    if tok.startswith("+"):
+        h_code = tok[1:]
+        if len(h_code) < 5:
+            return None
+        return f"inv:{h_code}", f"https://t.me/+{h_code}"
+
+    if tok.lower().startswith("joinchat/"):
+        h_code = tok.split("/", 1)[1]
+        if len(h_code) < 5:
+            return None
+        return f"inv:{h_code}", f"https://t.me/+{h_code}"
+
+    if tok.lower().startswith("c/"):
+        parts = tok.split("/")
+        if len(parts) >= 2 and parts[1].isdigit():
+            c_id = parts[1]
+            post_part = f"/{parts[2]}" if len(parts) >= 3 and parts[2].isdigit() else ""
+            return f"cid:{c_id}", f"https://t.me/c/{c_id}{post_part}"
+        return None
+
+    uname = tok.split("/", 1)[0]
+    low = uname.lower()
+    if low in _RESERVED_TME_PATHS or low.endswith("bot"):
+        return None
+    return f"user:{low}", f"https://t.me/{uname}"
+
+def _extract_links_from_blobs(texts: list[str]) -> list[tuple[str, str]]:
+    seen: dict[str, str] = {}
+    for blob in texts:
+        for m in _TME_LINK_RE.finditer(blob):
+            norm = _normalize_telegram_candidate(m.group(1), is_at_username=False)
+            if norm and norm[0] not in seen:
+                seen[norm[0]] = norm[1]
+        for m in _AT_USER_RE.finditer(blob):
+            norm = _normalize_telegram_candidate(m.group(1), is_at_username=True)
+            if norm and norm[0] not in seen:
+                seen[norm[0]] = norm[1]
+    return list(seen.items())
+
+def extract_telegram_links_from_message(message) -> list[tuple[str, str]]:
+    """Extracts deduplicated Telegram group/channel (canon_key, display_url) pairs from text, entities & buttons."""
+    if not message:
+        return []
+    texts: list[str] = []
+    txt = getattr(message, "raw_text", None) or getattr(message, "message", None) or ""
+    if txt:
+        texts.append(txt)
+
+    for ent in getattr(message, "entities", None) or []:
+        u = getattr(ent, "url", None)
+        if u:
+            texts.append(u)
+
+    rm = getattr(message, "reply_markup", None)
+    if rm and getattr(rm, "rows", None):
+        for row in rm.rows:
+            for btn in getattr(row, "buttons", None) or []:
+                u = getattr(btn, "url", None) or getattr(getattr(btn, "type", None), "url", None)
+                if u:
+                    texts.append(u)
+
+    return _extract_links_from_blobs(texts)
+
+def get_active_hunt(prof_key: str) -> dict:
+    prof_key = str(prof_key)
+    if prof_key not in active_link_hunts:
+        active_link_hunts[prof_key] = {"running": False, "should_stop": False, "task": None}
+    return active_link_hunts[prof_key]
+
+def trigger_hunt_stop(prof_key: str, sender_id: int | None = None) -> tuple[bool, str]:
+    candidates = [str(prof_key)]
+    if sender_id is not None:
+        candidates.append(str(sender_id))
+    for k in list(active_link_hunts.keys()):
+        if k not in candidates:
+            candidates.append(k)
+    for k in candidates:
+        st = active_link_hunts.get(k)
+        if st and st.get("running"):
+            st["should_stop"] = True
+            t = st.get("task")
+            if t and not t.done():
+                t.cancel()
+            return True, k
+    return False, str(prof_key)
+
+async def leave_chat_silently(uc: TelegramClient, ent):
+    if ent is None:
+        return
+    try:
+        if isinstance(ent, types.Channel):
+            await uc(functions.channels.LeaveChannelRequest(ent))
+        elif isinstance(ent, types.Chat):
+            await uc(functions.messages.DeleteChatUserRequest(ent.id, types.InputUserSelf()))
+    except Exception:
+        pass
+
+async def resolve_chat_link_for_hunt(uc: TelegramClient, raw_or_key: str, allow_join: bool = True) -> tuple[object | None, bool, str]:
+    """
+    Resolves a Telegram link, @username, peer ID, or normalized key ('inv:', 'cid:', 'user:').
+    Returns (entity, freshly_joined, status_note). Re-raises FloodWaitError for caller backoff.
+    """
+    s = str(raw_or_key or "").strip()
+    if not s:
+        return None, False, "empty"
+
+    canon_key = ""
+    if s.startswith(("inv:", "cid:", "user:")):
+        canon_key = s
+    elif (s.startswith("-") and s[1:].isdigit()) or s.isdigit():
+        canon_key = f"peer:{int(s)}"
+    else:
+        extracted = _extract_links_from_blobs([s])
+        if extracted:
+            canon_key = extracted[0][0]
+        else:
+            cleaned = clean_chat_input(s)
+            if isinstance(cleaned, int):
+                canon_key = f"peer:{cleaned}"
+            else:
+                canon_key = f"user:{str(cleaned).lstrip('@').lower()}"
+
+    ent = None
+    freshly_joined = False
+    try:
+        if canon_key.startswith("inv:"):
+            invite_hash = canon_key.split(":", 1)[1]
+            chk = await uc(functions.messages.CheckChatInviteRequest(invite_hash))
+            if isinstance(chk, (types.ChatInviteAlready, types.ChatInvitePeek)):
+                ent = getattr(chk, "chat", None)
+            elif isinstance(chk, types.ChatInvite):
+                if getattr(chk, "request_needed", False):
+                    return None, False, "approval_required"
+                if not allow_join:
+                    return None, False, "join_skipped"
+                updates = await uc(functions.messages.ImportChatInviteRequest(invite_hash))
+                if getattr(updates, "chats", None):
+                    ent = updates.chats[0]
+                    freshly_joined = True
+        elif canon_key.startswith("cid:"):
+            peer_id = int(f"-100{canon_key.split(':', 1)[1]}")
+            ent = await uc.get_entity(peer_id)
+        elif canon_key.startswith("peer:"):
+            peer_id = int(canon_key.split(":", 1)[1])
+            ent = await uc.get_entity(peer_id)
+        elif canon_key.startswith("user:"):
+            uname = canon_key.split(":", 1)[1]
+            ent = await uc.get_entity(uname)
+    except FloodWaitError:
+        raise
+    except tl_errors.UserAlreadyParticipantError:
+        if canon_key.startswith("inv:"):
+            try:
+                chk = await uc(functions.messages.CheckChatInviteRequest(canon_key.split(":", 1)[1]))
+                ent = getattr(chk, "chat", None)
+            except FloodWaitError:
+                raise
+            except Exception:
+                return None, False, "private"
+    except (tl_errors.InviteHashExpiredError, tl_errors.InviteHashInvalidError, tl_errors.UsernameInvalidError, tl_errors.UsernameNotOccupiedError):
+        return None, False, "invalid"
+    except tl_errors.InviteRequestSentError:
+        return None, False, "approval_required"
+    except tl_errors.ChannelsTooMuchError:
+        return None, False, "too_many_channels"
+    except (tl_errors.ChannelPrivateError, ValueError, PeerIdInvalidError):
+        return None, False, "private"
+    except Exception as e:
+        logger.debug(f"Hunt resolve error ({canon_key}): {e}")
+        return None, False, "error"
+
+    if ent is None or isinstance(ent, types.User):
+        return None, freshly_joined, "not_chat"
+    if getattr(ent, "deactivated", False) or type(ent).__name__.endswith("Forbidden"):
+        return None, freshly_joined, "private"
+    return ent, freshly_joined, "ok"
+
+async def count_real_videos_in_chat(uc: TelegramClient, ent) -> int:
+    """Counts videos in a group/channel via VideoIndex and checks Document-videos if needed."""
+    vid_count = 0
+    try:
+        vid_probe = await uc.get_messages(ent, limit=1, filter=types.InputMessagesFilterVideo)
+        vid_count = getattr(vid_probe, "total", 0) or len(vid_probe)
+    except FloodWaitError:
+        raise
+    except Exception:
+        return 0
+
+    if vid_count > HUNT_MIN_VIDEOS:
+        return vid_count
+
+    # Also check video files uploaded as documents if gallery count alone <= 100
+    doc_tot = 0
+    try:
+        doc_probe = await uc.get_messages(ent, limit=1, filter=types.InputMessagesFilterDocument)
+        doc_tot = getattr(doc_probe, "total", 0) or len(doc_probe)
+    except FloodWaitError:
+        raise
+    except Exception:
+        doc_tot = 0
+
+    if vid_count + doc_tot <= HUNT_MIN_VIDEOS:
+        return vid_count
+
+    doc_vids = 0
+    try:
+        async for dm in uc.iter_messages(ent, limit=min(doc_tot, 400), filter=types.InputMessagesFilterDocument):
+            if is_video_message(dm):
+                doc_vids += 1
+    except FloodWaitError:
+        raise
+    except Exception:
+        pass
+    return vid_count + doc_vids
+
+async def send_link_hunt_report(
+    reply_chat_id: int,
+    status_msg_id: int,
+    prof_key: str,
+    start_title: str,
+    total_links: int,
+    checked_count: int,
+    matches: list[dict],
+    skipped_under: int,
+    skipped_err: int,
+    stop_reason: str = "",
+):
+    matches_sorted = sorted(matches, key=lambda x: x["videos"], reverse=True)
+    header_tag = "✅ <b>লিংক খুঁজা রিপোর্ট সম্পন্ন!</b>" if not stop_reason else f"⚠️ <b>লিংক খুঁজা {stop_reason}</b>"
+    summary = (
+        f"{header_tag}\n\n"
+        f"📂 <b>মূল গ্রুপ:</b> {h(start_title)}\n"
+        f"🔗 <b>মোট ইউনিক লিংক পাওয়া গেছে:</b> <code>{total_links}</code> টি\n"
+        f"🔎 <b>যাচাই করা হয়েছে:</b> <code>{checked_count}</code> টি\n"
+        f"🎬 <b>{HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত লিংক:</b> <code>{len(matches_sorted)}</code> টি\n"
+        f"♻️ <b>{HUNT_MIN_VIDEOS} বা কম / অকার্যকর বাদ:</b> <code>{skipped_under + skipped_err}</code> টি"
+    )
+
+    nav_buttons = [
+        [Button.inline("🔍 আরেকটি গ্রুপে খুঁজুন", f"hunt:{prof_key}".encode())],
+        [Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())],
+    ]
+
+    if not matches_sorted:
+        try:
+            await bot_client.edit_message(
+                reply_chat_id,
+                status_msg_id,
+                summary + f"\n\n😔 এই গ্রুপে {HUNT_MIN_VIDEOS}-টির বেশি ভিডিও আছে এমন কোনো কার্যকর লিংক পাওয়া যায়নি।",
+                buttons=nav_buttons,
+            )
+        except Exception:
+            await bot_client.send_message(
+                reply_chat_id,
+                summary + f"\n\n😔 এই গ্রুপে {HUNT_MIN_VIDEOS}-টির বেশি ভিডিও আছে এমন কোনো কার্যকর লিংক পাওয়া যায়নি।",
+                buttons=nav_buttons,
+                link_preview=False,
+            )
+        return
+
+    try:
+        await bot_client.edit_message(
+            reply_chat_id,
+            status_msg_id,
+            summary + "\n\n👇 <b>নিচে ১০০+ ভিডিওযুক্ত সব লিংকের তালিকা দেওয়া হলো:</b>",
+        )
+    except Exception:
+        pass
+
+    # Chunk report safely under Telegram's 4096-character limit per message
+    chunks: list[str] = []
+    cur_lines: list[str] = []
+    cur_len = 0
+    for idx, item in enumerate(matches_sorted, 1):
+        entry = (
+            f"{idx}. <b>{h(item['title'][:50])}</b> — 🎬 <code>{item['videos']}</code> টি ভিডিও\n"
+            f"🔗 {h(item['link'])}"
+        )
+        if cur_len + len(entry) + 2 > 3500 and cur_lines:
+            chunks.append("\n\n".join(cur_lines))
+            cur_lines = [entry]
+            cur_len = len(entry)
+        else:
+            cur_lines.append(entry)
+            cur_len += len(entry) + 2
+    if cur_lines:
+        chunks.append("\n\n".join(cur_lines))
+
+    for ci, chunk in enumerate(chunks):
+        is_last = (ci == len(chunks) - 1)
+        await bot_client.send_message(
+            reply_chat_id,
+            chunk,
+            buttons=nav_buttons if is_last else None,
+            link_preview=False,
+        )
+
+async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, reply_chat_id: int, status_msg_id: int):
+    hunt_state = get_active_hunt(prof_key)
+    hunt_state["running"] = True
+    hunt_state["should_stop"] = False
+    hunt_state["task"] = asyncio.current_task()
+
+    uc = user_clients.get(acc_id) if (acc_id and acc_id in user_clients) else None
+    if not uc:
+        await bot_client.edit_message(
+            reply_chat_id,
+            status_msg_id,
+            "⚠️ গ্রুপ লিংক চেক করতে হলে আপনার টেলিগ্রাম অ্যাকাউন্ট কানেক্ট থাকতে হবে!",
+            buttons=[[Button.inline("📲 অ্যাকাউন্ট কানেক্ট করুন", f"login:{prof_key}".encode())], [Button.inline("🔙 ড্যাশবোর্ড", f"home:{prof_key}".encode())]],
+        )
+        hunt_state["running"] = False
+        hunt_state["task"] = None
+        return
+
+    matches: list[dict] = []
+    discovered: dict[str, str] = {}
+    checked_count = 0
+    skipped_under = 0
+    skipped_err = 0
+    start_title = str(target_input)
+    stop_reason = ""
+
+    try:
+        # Step 1: Resolve starting group
+        try:
+            start_ent, start_joined, note = await resolve_chat_link_for_hunt(uc, target_input, allow_join=True)
+        except FloodWaitError as fl:
+            await bot_client.edit_message(
+                reply_chat_id,
+                status_msg_id,
+                f"⏳ টেলিগ্রাম রেট-লিমিটের কারণে এখন এই লিংকটি খোলা যাচ্ছে না ({fl.seconds} সেকেন্ড বিরতি)।",
+                buttons=[[Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]],
+            )
+            return
+
+        if not start_ent:
+            reason_bn = {
+                "invalid": "লিংকটি ভুল বা মেয়াদ শেষ হয়েছে",
+                "approval_required": "গ্রুপটিতে অ্যাডমিন অ্যাপ্রুভাল লাগে",
+                "private": "গ্রুপটি প্রাইভেট বা অ্যাক্সেস নেই",
+                "too_many_channels": "আপনার অ্যাকাউন্টে সর্বোচ্চ চ্যানেল জয়েন লিমিট পূর্ণ হয়েছে",
+            }.get(note, "গ্রুপটি পাওয়া যায়নি")
+            await bot_client.edit_message(
+                reply_chat_id,
+                status_msg_id,
+                f"❌ মূল গ্রুপটি খোলা যায়নি: <b>{reason_bn}</b>\n🔗 <code>{h(target_input)}</code>",
+                buttons=[[Button.inline("🔍 আবার চেষ্টা করুন", f"hunt:{prof_key}".encode())], [Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())]],
+            )
+            return
+
+        start_pid = normalize_peer_id(start_ent)
+        start_canon = to_canonical_id(start_pid)
+        start_title = getattr(start_ent, "title", None) or getattr(start_ent, "username", str(start_pid))
+
+        await bot_client.edit_message(
+            reply_chat_id,
+            status_msg_id,
+            f"🔍 <b>গ্রুপ থেকে সব লিংক সংগ্রহ করা হচ্ছে...</b>\n\n"
+            f"📂 <b>গ্রুপ:</b> {h(start_title)}\n"
+            f"⏳ অনুগ্রহ করে অপেক্ষা করুন...",
+            buttons=[[Button.inline("🛑 থামান", f"hs:{prof_key}".encode())]],
+        )
+
+        # Step 2: Scan messages inside starting group for all Telegram links
+        total_msgs = 0
+        try:
+            probe = await uc.get_messages(start_ent, limit=1)
+            total_msgs = getattr(probe, "total", 0) or len(probe)
+        except Exception:
+            pass
+
+        scan_filter = types.InputMessagesFilterUrl if total_msgs > 5000 else None
+        scanned_msgs = 0
+        last_edit = 0.0
+        async for m in resilient_iter_messages(
+            uc,
+            start_ent,
+            filter_obj=scan_filter,
+            server_total=total_msgs if scan_filter is None else 0,
+            should_stop_fn=lambda: bool(hunt_state["should_stop"]),
+            label=f"hunt:{start_title}",
+        ):
+            if hunt_state["should_stop"]:
+                stop_reason = "ব্যবহারকারী থামিয়েছেন"
+                break
+            scanned_msgs += 1
+            for ck, disp in extract_telegram_links_from_message(m):
+                if ck not in discovered:
+                    discovered[ck] = disp
+
+            now_m = time.monotonic()
+            if now_m - last_edit >= 3.5:
+                last_edit = now_m
+                try:
+                    await bot_client.edit_message(
+                        reply_chat_id,
+                        status_msg_id,
+                        f"🔍 <b>গ্রুপ থেকে সব লিংক খোঁজা হচ্ছে...</b>\n\n"
+                        f"📂 <b>গ্রুপ:</b> {h(start_title)}\n"
+                        f"🔎 স্ক্যান করা মেসেজ: <code>{scanned_msgs}</code> টি\n"
+                        f"🔗 পাওয়া ইউনিক লিংক: <code>{len(discovered)}</code> টি",
+                        buttons=[[Button.inline("🛑 থামান", f"hs:{prof_key}".encode())]],
+                    )
+                except Exception:
+                    pass
+
+        link_items = list(discovered.items())
+        if not link_items:
+            await send_link_hunt_report(reply_chat_id, status_msg_id, prof_key, start_title, 0, 0, [], 0, 0, stop_reason)
+            return
+
+        # Step 3: Verify each link 1-by-1 cleanly, checking > 100 videos
+        seen_peer_canons: set[int] = {start_canon}
+        last_edit = 0.0
+
+        for idx, (ck, disp_url) in enumerate(link_items, 1):
+            if hunt_state["should_stop"]:
+                stop_reason = "ব্যবহারকারী থামিয়েছেন"
+                break
+
+            ent = None
+            freshly_joined = False
+            is_dup_chat = False
+            vid_total = 0
+            status_note = "error"
+            try:
+                for attempt in range(2):
+                    try:
+                        ent, freshly_joined, status_note = await resolve_chat_link_for_hunt(uc, ck, allow_join=True)
+                        break
+                    except FloodWaitError as fl:
+                        if fl.seconds > 90:
+                            stop_reason = f"টেলিগ্রাম লিমিটের ({fl.seconds}s) কারণে বিরতি"
+                            raise StopAsyncIteration
+                        await bot_client.edit_message(
+                            reply_chat_id,
+                            status_msg_id,
+                            f"⏳ <b>টেলিগ্রাম লিমিটের কারণে {fl.seconds} সেকেন্ড অপেক্ষা করছে...</b>\n"
+                            f"🔎 যাচাই: <code>{checked_count}/{len(link_items)}</code> | ✅ ১০০+ ভিডিও: <code>{len(matches)}</code> টি",
+                            buttons=[[Button.inline("🛑 থামান ও রিপোর্ট দেখুন", f"hs:{prof_key}".encode())]],
+                        )
+                        for _ in range((fl.seconds + 2) // 2 + 1):
+                            if hunt_state["should_stop"]:
+                                break
+                            await asyncio.sleep(2.0)
+
+                if hunt_state["should_stop"]:
+                    stop_reason = "ব্যবহারকারী থামিয়েছেন"
+                    break
+
+                checked_count += 1
+                if status_note == "too_many_channels":
+                    stop_reason = "অ্যাকাউন্টের সর্বোচ্চ চ্যানেল জয়েন লিমিট পূর্ণ হওয়ায় থেমেছে"
+                    break
+                if not ent:
+                    skipped_err += 1
+                    continue
+
+                pid = normalize_peer_id(ent)
+                pcanon = to_canonical_id(pid)
+                if pcanon in seen_peer_canons:
+                    is_dup_chat = True
+                    skipped_err += 1
+                    continue
+                seen_peer_canons.add(pcanon)
+
+                try:
+                    vid_total = await count_real_videos_in_chat(uc, ent)
+                except FloodWaitError as fl:
+                    if fl.seconds > 90:
+                        stop_reason = f"টেলিগ্রাম লিমিটের ({fl.seconds}s) কারণে বিরতি"
+                        break
+                    await asyncio.sleep(min(fl.seconds + 2, 92))
+                    vid_total = await count_real_videos_in_chat(uc, ent)
+
+                if vid_total > HUNT_MIN_VIDEOS:
+                    ctitle = getattr(ent, "title", None) or getattr(ent, "username", None) or disp_url
+                    matches.append({"title": ctitle, "videos": vid_total, "link": disp_url, "id": pid})
+                else:
+                    skipped_under += 1
+            except StopAsyncIteration:
+                break
+            finally:
+                # Auto-leave temporary freshly joined junk/duplicate chats so account doesn't hit 500-channel cap
+                if freshly_joined and ent and (is_dup_chat or vid_total <= HUNT_MIN_VIDEOS):
+                    await leave_chat_silently(uc, ent)
+
+            # Polite pacing to minimize Invite/Resolve FloodWaits
+            await asyncio.sleep(1.5 if freshly_joined else 0.45)
+
+            now_m = time.monotonic()
+            if now_m - last_edit >= 3.0 or idx == len(link_items):
+                last_edit = now_m
+                try:
+                    await bot_client.edit_message(
+                        reply_chat_id,
+                        status_msg_id,
+                        f"🔎 <b>লিংক যাচাই চলছে...</b>\n\n"
+                        f"📂 <b>মূল গ্রুপ:</b> {h(start_title)}\n"
+                        f"🔗 <b>পাওয়া মোট লিংক:</b> <code>{len(link_items)}</code> টি\n"
+                        f"📊 <b>চেক সম্পন্ন:</b> <code>{idx}/{len(link_items)}</code> টি\n"
+                        f"✅ <b>{HUNT_MIN_VIDEOS}+ ভিডিও মিলেছে:</b> <code>{len(matches)}</code> টি\n"
+                        f"♻️ <b>বাদ পড়েছে:</b> <code>{skipped_under + skipped_err}</code> টি",
+                        buttons=[[Button.inline("🛑 থামান ও এখনকার রিপোর্ট দেখুন", f"hs:{prof_key}".encode())]],
+                    )
+                except Exception:
+                    pass
+
+        await send_link_hunt_report(
+            reply_chat_id, status_msg_id, prof_key, start_title,
+            len(link_items), checked_count, matches, skipped_under, skipped_err, stop_reason
+        )
+    except asyncio.CancelledError:
+        hunt_state["should_stop"] = True
+        await send_link_hunt_report(
+            reply_chat_id, status_msg_id, prof_key, start_title,
+            len(discovered), checked_count, matches, skipped_under, skipped_err, "ব্যবহারকারী থামিয়েছেন"
+        )
+    except Exception as e:
+        logger.error(f"Link hunter error [{prof_key}]: {e}")
+        await send_link_hunt_report(
+            reply_chat_id, status_msg_id, prof_key, start_title,
+            len(discovered), checked_count, matches, skipped_under, skipped_err, f"সমস্যা: {h(e)}"
+        )
+    finally:
+        hunt_state["running"] = False
+        hunt_state["task"] = None
+
+async def prompt_link_hunt(send_or_edit_fn, sender_id: int, prof_key: str):
+    profile = get_profile(prof_key)
+    acc_id = profile.get("active_account_id")
+    if not acc_id or acc_id not in user_clients:
+        await send_or_edit_fn(
+            "⚠️ গ্রুপের ভেতরের সব লিংক খুঁজতে আপনার টেলিগ্রাম অ্যাকাউন্ট কানেক্ট থাকতে হবে। নিচের বাটনে চাপুন:",
+            buttons=[
+                [Button.inline("📲 অ্যাকাউন্ট কানেক্ট করুন", f"login:{prof_key}".encode())],
+                [Button.inline("🔙 মূল ড্যাশবোর্ড", f"home:{prof_key}".encode())],
+            ],
+        )
+        return
+
+    hunt_state = get_active_hunt(prof_key)
+    if hunt_state.get("running"):
+        await send_or_edit_fn(
+            "⚠️ ইতিমধ্যেই একটি লিংক খোঁজার কাজ চলছে!",
+            buttons=[[Button.inline("🛑 চলমান স্ক্যান থামান", f"hs:{prof_key}".encode())], [Button.inline("🔙 ড্যাশবোর্ড", f"home:{prof_key}".encode())]],
+        )
+        return
+
+    pending_logins.pop(sender_id, None)
+    pending_link_hunts[sender_id] = {"prof_key": prof_key, "created_at": time.monotonic()}
+
+    btns = []
+    # Quick picks from connected user's cached groups or selected sources
+    quick_items = dialog_caches.get(acc_id, {}).get("list", [])[:4]
+    for it in quick_items:
+        cid = it["id"]
+        title = it["title"][:24]
+        btns.append([Button.inline(f"📂 {title}", f"hp:{prof_key}:{cid}".encode())])
+    btns.append([Button.inline("❌ বাতিল করুন", f"hc:{prof_key}".encode())])
+
+    await send_or_edit_fn(
+        "🔍 <b>লিংক খুজা (১০০+ ভিডিও ফাইন্ডার)</b>\n\n"
+        "যেকোনো একটি গ্রুপ বা চ্যানেলের লিংক এখানে পাঠান (যেমন: <code>https://t.me/+...</code> বা <code>https://t.me/channel</code> বা <code>@username</code>)\n\n"
+        "💡 <i>বট ওই গ্রুপের ভেতরের সব লিংক একটি একটি করে চেক করে, যেসব গ্রুপ/চ্যানেলে <b>১০০-টির বেশি ভিডিও</b> আছে সবগুলোর লিংকসহ একসাথে রিপোর্ট দিবে!</i>\n\n"
+        "অথবা নিচ থেকে আপনার যেকোনো গ্রুপে চাপুন:",
+        buttons=btns,
+    )
+
 # ==================== UI TEXT & BUTTON BUILDERS ====================
 
 def get_account_badge(profile: dict) -> str:
@@ -2225,6 +2824,7 @@ def get_main_menu_buttons(prof_key: str, is_private: bool = True):
             Button.inline("🔄 ২০০টি সিঙ্ক", f"sync:{prof_key}:200".encode()),
             Button.inline("🔄 ৫০০টি সিঙ্ক", f"sync:{prof_key}:500".encode()),
         ],
+        [Button.inline("🔍 লিংক খুজা", f"hunt:{prof_key}".encode())],
         [
             Button.inline("👤 অ্যাকাউন্ট ম্যানেজার", f"acc:{prof_key}".encode()),
             Button.inline("⚙️ সেটিংস ও অপশন", f"cfg:{prof_key}".encode()),
@@ -2853,6 +3453,14 @@ async def bot_stop_cmd_handler(event):
             buttons=[[Button.inline("🎛️ মূল ড্যাশবোর্ড", f"home:{matched_key}".encode())]],
         )
 
+@bot_client.on(events.NewMessage(pattern=r"^/(findlinks|linkhunt|hunt)(?:@autforwbdbot)?$"))
+async def bot_findlinks_cmd_handler(event):
+    if event.out or not await is_operator_authorized(event):
+        return
+    prof_key, _ = await resolve_profile_key_from_chat(event)
+    sender_id = getattr(event, "sender_id", None) or event.chat_id
+    await prompt_link_hunt(event.reply, sender_id, prof_key)
+
 # ==================== BOT CALLBACK HANDLER ====================
 
 @bot_client.on(events.CallbackQuery)
@@ -2977,8 +3585,48 @@ async def bot_callback_handler(event):
     profile = get_profile(prof_key)
 
     if cmd == "home":
+        pending_link_hunts.pop(event.sender_id, None)
         await event.answer()
         await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
+        return
+
+    if cmd == "hunt":
+        await event.answer()
+        async def _edit_or_send(txt, buttons=None):
+            return await safe_edit_message(event, txt, buttons=buttons)
+        await prompt_link_hunt(_edit_or_send, event.sender_id, prof_key)
+        return
+
+    if cmd == "hc":
+        pending_link_hunts.pop(event.sender_id, None)
+        await event.answer("❌ বাতিল করা হয়েছে")
+        await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
+        return
+
+    if cmd == "hs":
+        stopped, _ = trigger_hunt_stop(prof_key, event.sender_id)
+        if stopped:
+            await event.answer("🛑 থামানো হচ্ছে ও রিপোর্ট তৈরি হচ্ছে...", alert=False)
+        else:
+            await event.answer("কোনো লিংক খোঁজার কাজ চলছে না।", alert=True)
+        return
+
+    if cmd == "hp":
+        pending_link_hunts.pop(event.sender_id, None)
+        hunt_state = get_active_hunt(prof_key)
+        if hunt_state.get("running"):
+            await event.answer("⚠️ ইতিমধ্যেই একটি লিংক খোঁজার কাজ চলছে!", alert=True)
+            return
+        cid = parts[2] if len(parts) > 2 else ""
+        acc_id = profile.get("active_account_id")
+        await event.answer("🔍 লিংক খোঁজা শুরু হচ্ছে...")
+        status_msg = await safe_edit_message(
+            event,
+            "🔍 <b>লিংক খোঁজা শুরু হচ্ছে...</b>",
+            buttons=[[Button.inline("🛑 থামান", f"hs:{prof_key}".encode())]],
+        )
+        msg_id = status_msg.id if status_msg else event.message_id
+        hunt_state["task"] = asyncio.create_task(run_link_hunter(prof_key, acc_id, cid, event.chat_id, msg_id))
         return
 
     if cmd == "cfg":
@@ -3309,6 +3957,52 @@ async def bot_message_handler(event):
                 await event.reply(f"❌ পাসওয়ার্ড ভুল হয়েছে: <code>{h(e)}</code>\nআবার সঠিক পাসওয়ার্ড দিন:")
             return
 
+    # 1b. Handle active Link Hunter prompt (DM or group command reply)
+    hunt_sender_key = getattr(event, "sender_id", None) or event.chat_id
+    if hunt_sender_key in pending_link_hunts:
+        msg_links = extract_telegram_links_from_message(event.message)
+        has_link_or_text = bool(raw_text or msg_links)
+        if event.is_private or has_link_or_text:
+            hst = pending_link_hunts[hunt_sender_key]
+            h_prof_key = hst["prof_key"]
+            if raw_text == "❌ বাতিল করুন":
+                pending_link_hunts.pop(hunt_sender_key, None)
+                await event.reply("❌ লিংক খোঁজা বাতিল করা হয়েছে।", buttons=Button.clear())
+                await event.reply(get_main_menu_text(h_prof_key), buttons=get_main_menu_buttons(h_prof_key, event.is_private))
+                return
+
+            target_input = (
+                msg_links[0][1]
+                if msg_links
+                else (raw_text if re.fullmatch(r"-?\d{5,20}", raw_text) else None)
+            )
+            if not target_input:
+                await event.reply(
+                    "⚠️ অনুগ্রহ করে একটি বৈধ টেলিগ্রাম গ্রুপ/চ্যানেলের লিংক পাঠান (যেমন: <code>https://t.me/+...</code> বা <code>@username</code>):",
+                    buttons=[[Button.inline("❌ বাতিল করুন", f"hc:{h_prof_key}".encode())]],
+                )
+                return
+
+            pending_link_hunts.pop(hunt_sender_key, None)
+            hunt_state = get_active_hunt(h_prof_key)
+            if hunt_state.get("running"):
+                await event.reply(
+                    "⚠️ ইতিমধ্যেই একটি লিংক খোঁজার কাজ চলছে!",
+                    buttons=[[Button.inline("🛑 চলমান স্ক্যান থামান", f"hs:{h_prof_key}".encode())]],
+                )
+                return
+
+            h_prof = get_profile(h_prof_key)
+            h_acc_id = h_prof.get("active_account_id")
+            status_msg = await event.reply(
+                "🔍 <b>লিংক খোঁজা শুরু হচ্ছে...</b>",
+                buttons=[[Button.inline("🛑 থামান", f"hs:{h_prof_key}".encode())]],
+            )
+            hunt_state["task"] = asyncio.create_task(
+                run_link_hunter(h_prof_key, h_acc_id, target_input, event.chat_id, status_msg.id)
+            )
+            return
+
     # 2. Bot-side forwarding for Bot-Admin Source Channels/Groups (when Userbot isn't present or handles Bot DMs)
     if not event.is_private:
         canon_chat_id = to_canonical_id(event.chat_id)
@@ -3421,6 +4115,10 @@ async def pending_login_reaper():
                 except Exception:
                     pass
                 pending_logins.pop(uid, None)
+        for uid in list(pending_link_hunts.keys()):
+            hst = pending_link_hunts.get(uid)
+            if hst and (now - hst.get("created_at", now) > 600):
+                pending_link_hunts.pop(uid, None)
 
 async def handle_health(reader, writer):
     try:
