@@ -2158,20 +2158,21 @@ async def run_multi_bulk_sync(prof_key: str, limit_count: int | None, reply_chat
 
 # ==================== LINK HUNTER (100+ VIDEO GROUP FINDER) ====================
 
-HUNT_MIN_VIDEOS = 100  # Strictly > 100 videos required
+HUNT_MIN_VIDEOS = 50  # Minimum videos required (>= 50 videos)
 _RESERVED_TME_PATHS = {
     "addstickers", "addemoji", "addtheme", "share", "proxy", "socks", "iv",
     "setlanguage", "bg", "boost", "joinchat", "c", "s", "nft", "giftcode",
     "invoice", "login", "confirm", "contact", "botfather", "spambot", "telegram",
 }
 _TME_LINK_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(?:s/)?"
+    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.(?:me|dog)/(?:s/)?"
     r"(\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|c/\d+(?:/\d+)?|[A-Za-z][A-Za-z0-9_]{3,31}(?:/\d+)?)",
     re.IGNORECASE,
 )
 _TG_DEEP_INV_RE = re.compile(r"tg://join\?invite=([A-Za-z0-9_-]+)", re.IGNORECASE)
 _TG_DEEP_USER_RE = re.compile(r"tg://resolve\?domain=([A-Za-z][A-Za-z0-9_]{3,31})", re.IGNORECASE)
 _AT_USER_RE = re.compile(r"(?<![A-Za-z0-9_.])@([A-Za-z][A-Za-z0-9_]{3,31})")
+_ZW_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 
 def _normalize_telegram_candidate(raw_token: str, is_at_username: bool = False) -> tuple[str, str] | None:
     tok = raw_token.strip().rstrip(".,;:!?)\"'<>")
@@ -2212,7 +2213,10 @@ def _normalize_telegram_candidate(raw_token: str, is_at_username: bool = False) 
 
 def _extract_links_from_blobs(texts: list[str]) -> list[tuple[str, str]]:
     seen: dict[str, str] = {}
-    for blob in texts:
+    for raw_blob in texts:
+        blob = _ZW_RE.sub("", raw_blob or "")
+        if not blob:
+            continue
         for m in _TME_LINK_RE.finditer(blob):
             norm = _normalize_telegram_candidate(m.group(1), is_at_username=False)
             if norm and norm[0] not in seen:
@@ -2254,8 +2258,11 @@ def extract_telegram_links_from_message(message) -> list[tuple[str, str]]:
                     texts.append(u)
 
     wp = getattr(getattr(message, "media", None), "webpage", None)
-    if wp and getattr(wp, "url", None):
-        texts.append(wp.url)
+    if wp:
+        if getattr(wp, "url", None):
+            texts.append(wp.url)
+        if getattr(wp, "description", None):
+            texts.append(wp.description)
 
     return _extract_links_from_blobs(texts)
 
@@ -2349,7 +2356,16 @@ async def resolve_chat_link_for_hunt(
                 ent = await uc.get_entity(peer_id)
         elif canon_key.startswith("user:"):
             uname = canon_key.split(":", 1)[1]
-            ent = await uc.get_entity(uname)
+            # Fast cached lookup before making ResolveUsernameRequest RPC
+            if acc_id:
+                for (ck_k, _), c_ent in list(entity_caches.items()):
+                    if ck_k == f"u_{acc_id}":
+                        cu = (getattr(c_ent, "username", None) or "").lower()
+                        if cu == uname:
+                            ent = c_ent
+                            break
+            if ent is None:
+                ent = await uc.get_entity(uname)
     except FloodWaitError:
         raise
     except tl_errors.UserAlreadyParticipantError:
@@ -2390,10 +2406,10 @@ async def count_real_videos_in_chat(uc: TelegramClient, ent) -> int:
     except Exception:
         return 0
 
-    if vid_count > HUNT_MIN_VIDEOS:
+    if vid_count >= HUNT_MIN_VIDEOS:
         return vid_count
 
-    # Also check video files uploaded as documents if gallery count alone <= 100
+    # Also check video files uploaded as documents if gallery count alone < HUNT_MIN_VIDEOS
     doc_tot = 0
     try:
         doc_probe = await uc.get_messages(ent, limit=1, filter=types.InputMessagesFilterDocument)
@@ -2403,7 +2419,7 @@ async def count_real_videos_in_chat(uc: TelegramClient, ent) -> int:
     except Exception:
         doc_tot = 0
 
-    if vid_count + doc_tot <= HUNT_MIN_VIDEOS:
+    if vid_count + doc_tot < HUNT_MIN_VIDEOS:
         return vid_count
 
     doc_vids = 0
@@ -2437,7 +2453,7 @@ async def send_link_hunt_report(
         f"🔗 <b>মোট ইউনিক লিংক পাওয়া গেছে:</b> <code>{total_links}</code> টি\n"
         f"🔎 <b>যাচাই করা হয়েছে:</b> <code>{checked_count}</code> টি\n"
         f"🎬 <b>{HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত লিংক:</b> <code>{len(matches_sorted)}</code> টি\n"
-        f"♻️ <b>{HUNT_MIN_VIDEOS} বা কম / অকার্যকর বাদ:</b> <code>{skipped_under + skipped_err}</code> টি"
+        f"♻️ <b>{HUNT_MIN_VIDEOS}-এর কম / অকার্যকর বাদ:</b> <code>{skipped_under + skipped_err}</code> টি"
     )
 
     nav_buttons = [
@@ -2450,13 +2466,13 @@ async def send_link_hunt_report(
             await bot_client.edit_message(
                 reply_chat_id,
                 status_msg_id,
-                summary + f"\n\n😔 এই গ্রুপে {HUNT_MIN_VIDEOS}-টির বেশি ভিডিও আছে এমন কোনো কার্যকর লিংক পাওয়া যায়নি।",
+                summary + f"\n\n😔 এই গ্রুপে {HUNT_MIN_VIDEOS}টি বা তার বেশি ভিডিও আছে এমন কোনো কার্যকর লিংক পাওয়া যায়নি।",
                 buttons=nav_buttons,
             )
         except Exception:
             await bot_client.send_message(
                 reply_chat_id,
-                summary + f"\n\n😔 এই গ্রুপে {HUNT_MIN_VIDEOS}-টির বেশি ভিডিও আছে এমন কোনো কার্যকর লিংক পাওয়া যায়নি।",
+                summary + f"\n\n😔 এই গ্রুপে {HUNT_MIN_VIDEOS}টি বা তার বেশি ভিডিও আছে এমন কোনো কার্যকর লিংক পাওয়া যায়নি।",
                 buttons=nav_buttons,
                 link_preview=False,
             )
@@ -2466,7 +2482,7 @@ async def send_link_hunt_report(
         await bot_client.edit_message(
             reply_chat_id,
             status_msg_id,
-            summary + "\n\n👇 <b>নিচে ১০০+ ভিডিওযুক্ত সব লিংকের তালিকা দেওয়া হলো:</b>",
+            summary + f"\n\n👇 <b>নিচে {HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত সব লিংকের তালিকা দেওয়া হলো:</b>",
         )
     except Exception:
         pass
@@ -2499,6 +2515,75 @@ async def send_link_hunt_report(
             link_preview=False,
         )
 
+async def _iter_hunt_messages_desc(
+    uc: TelegramClient,
+    ent,
+    max_unfiltered: int = 15000,
+    should_stop_fn=None,
+    label: str = "",
+):
+    """
+    Reliably scans messages newest -> oldest (reverse=False) so cleared-history holes
+    never abort scanning after 1-2 messages:
+    - Pass 1: Unfiltered scan up to max_unfiltered messages (catches ALL text, @username,
+      inline buttons, hidden text-URLs, webpage cards, and tg:// links)
+    - Pass 2: If chat exceeds max_unfiltered, continues older messages with InputMessagesFilterUrl
+    """
+    seen_ids: set[int] = set()
+    desc_offset = 0
+
+    for phase, (phase_limit, phase_filter) in enumerate(((max_unfiltered, None), (None, types.InputMessagesFilterUrl))):
+        if phase == 1 and len(seen_ids) < max_unfiltered:
+            break
+        phase_count = 0
+        retries = 0
+        while retries < 8:
+            if should_stop_fn and should_stop_fn():
+                return
+            rem_limit = (phase_limit - phase_count) if phase_limit is not None else None
+            if rem_limit is not None and rem_limit <= 0:
+                break
+            try:
+                async for m in uc.iter_messages(
+                    ent,
+                    limit=rem_limit,
+                    offset_id=desc_offset,
+                    filter=phase_filter,
+                    reverse=False,
+                    wait_time=0.15,
+                ):
+                    if should_stop_fn and should_stop_fn():
+                        return
+                    if not m:
+                        continue
+                    if desc_offset == 0 or m.id < desc_offset:
+                        desc_offset = m.id
+                    if m.id in seen_ids:
+                        continue
+                    seen_ids.add(m.id)
+                    phase_count += 1
+                    yield m
+                break
+            except FloodWaitError as fl:
+                wait_s = min(fl.seconds + 2, 120)
+                logger.warning(f"Hunt history FloodWait ({fl.seconds}s) on {label} (phase={phase}): sleeping {wait_s}s...")
+                await asyncio.sleep(wait_s)
+                retries += 1
+            except (
+                asyncio.TimeoutError,
+                tl_errors.TimedOutError,
+                tl_errors.ServerError,
+                tl_errors.RpcCallFailError,
+                ConnectionError,
+                OSError,
+                ValueError,
+            ) as net_e:
+                retries += 1
+                wait_s = min(4 * retries, 30)
+                logger.warning(f"Hunt history retry {retries}/8 on {label} at offset={desc_offset} ({net_e})")
+                await asyncio.sleep(wait_s)
+
+
 async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, reply_chat_id: int, status_msg_id: int):
     hunt_state = get_active_hunt(prof_key)
     hunt_state["running"] = True
@@ -2524,8 +2609,10 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
     skipped_err = 0
     start_title = str(target_input)
     stop_reason = ""
+    partial_note = ""
 
     try:
+        logger.info(f"🔎 [LinkHunter:{prof_key}] Starting on input={target_input!r} (acc={acc_id})")
         # Step 1: Resolve starting group
         try:
             start_ent, start_joined, note = await resolve_chat_link_for_hunt(uc, target_input, allow_join=True, acc_id=acc_id)
@@ -2545,6 +2632,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 "private": "গ্রুপটি প্রাইভেট বা অ্যাক্সেস নেই",
                 "too_many_channels": "আপনার অ্যাকাউন্টে সর্বোচ্চ চ্যানেল জয়েন লিমিট পূর্ণ হয়েছে",
             }.get(note, "গ্রুপটি পাওয়া যায়নি")
+            logger.warning(f"🔎 [LinkHunter:{prof_key}] Cannot open start chat ({target_input!r}): note={note}")
             await bot_client.edit_message(
                 reply_chat_id,
                 status_msg_id,
@@ -2566,22 +2654,13 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
             buttons=[[Button.inline("🛑 থামান", f"hs:{prof_key}".encode())]],
         )
 
-        # Step 2: Scan messages inside starting group for all Telegram links
-        total_msgs = 0
-        try:
-            probe = await uc.get_messages(start_ent, limit=1)
-            total_msgs = getattr(probe, "total", 0) or len(probe)
-        except Exception:
-            pass
-
-        scan_filter = types.InputMessagesFilterUrl if total_msgs > 25000 else None
+        # Step 2: Scan messages newest -> oldest cleanly so ALL links across history are collected
         scanned_msgs = 0
         last_edit = 0.0
-        async for m in resilient_iter_messages(
+        async for m in _iter_hunt_messages_desc(
             uc,
             start_ent,
-            filter_obj=scan_filter,
-            server_total=total_msgs if scan_filter is None else 0,
+            max_unfiltered=15000,
             should_stop_fn=lambda: bool(hunt_state["should_stop"]),
             label=f"hunt:{start_title}",
         ):
@@ -2609,14 +2688,36 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 except Exception:
                     pass
 
-        link_items = list(discovered.items())
+        # Prioritize public/peer links BEFORE private invite joins so private-join rate limits never block public links
+        all_found = list(discovered.items())
+        public_items = [(ck, disp) for ck, disp in all_found if not ck.startswith("inv:")]
+        invite_items = [(ck, disp) for ck, disp in all_found if ck.startswith("inv:")]
+        link_items = public_items + invite_items
+        logger.info(
+            f"🔎 [LinkHunter:{prof_key}] Start={start_title!r}: scanned={scanned_msgs} msgs, "
+            f"unique_links={len(link_items)} (public/cid={len(public_items)}, invite={len(invite_items)})"
+        )
+
         if not link_items:
             await send_link_hunt_report(reply_chat_id, status_msg_id, prof_key, start_title, 0, 0, [], 0, 0, stop_reason)
             return
 
-        # Step 3: Verify each link 1-by-1 cleanly, checking > 100 videos
+        try:
+            await bot_client.edit_message(
+                reply_chat_id,
+                status_msg_id,
+                f"🔎 <b>মোট <code>{len(link_items)}</code> টি ইউনিক লিংক পাওয়া গেছে!</b>\n\n"
+                f"📂 <b>মূল গ্রুপ:</b> {h(start_title)}\n"
+                f"🎬 এখন প্রতিটি লিংক ১টি করে চেক করে {HUNT_MIN_VIDEOS}+ ভিডিওযুক্ত গ্রুপ আলাদা করা হচ্ছে...",
+                buttons=[[Button.inline("🛑 থামান ও এখনকার রিপোর্ট দেখুন", f"hs:{prof_key}".encode())]],
+            )
+        except Exception:
+            pass
+
+        # Step 3: Verify every single link 1-by-1 cleanly, checking >= 50 videos
         seen_peer_canons: set[int] = {start_canon}
-        last_edit = 0.0
+        private_join_blocked = False
+        last_edit = time.monotonic()
 
         for idx, (ck, disp_url) in enumerate(link_items, 1):
             if hunt_state["should_stop"]:
@@ -2628,20 +2729,31 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
             is_dup_chat = False
             vid_total = 0
             status_note = "error"
+            is_invite = ck.startswith("inv:")
             try:
                 for attempt in range(2):
                     try:
-                        ent, freshly_joined, status_note = await resolve_chat_link_for_hunt(uc, ck, allow_join=True)
+                        ent, freshly_joined, status_note = await resolve_chat_link_for_hunt(
+                            uc, ck, allow_join=(not private_join_blocked), acc_id=acc_id
+                        )
                         break
                     except FloodWaitError as fl:
-                        if fl.seconds > 90:
+                        if fl.seconds > 120:
+                            if is_invite:
+                                # Private invite hit long flood -> skip remaining fresh joins, keep checking other links!
+                                private_join_blocked = True
+                                partial_note = f"প্রাইভেট জয়েন লিমিট ({fl.seconds}s)-এর কারণে অজয়েন করা কিছু প্রাইভেট ইনভাইট বাদ পড়েছে"
+                                logger.warning(f"🔎 [LinkHunter:{prof_key}] Invite FloodWait ({fl.seconds}s) -> continuing remaining non-join checks")
+                                status_note = "invite_flood"
+                                ent = None
+                                break
                             stop_reason = f"টেলিগ্রাম লিমিটের ({fl.seconds}s) কারণে বিরতি"
                             raise StopAsyncIteration
                         await bot_client.edit_message(
                             reply_chat_id,
                             status_msg_id,
-                            f"⏳ <b>টেলিগ্রাম লিমিটের কারণে {fl.seconds} সেকেন্ড অপেক্ষা করছে...</b>\n"
-                            f"🔎 যাচাই: <code>{checked_count}/{len(link_items)}</code> | ✅ ১০০+ ভিডিও: <code>{len(matches)}</code> টি",
+                            f"⏳ <b>টেলিগ্রাম রেট-লিমিটের কারণে {fl.seconds} সেকেন্ড অপেক্ষা করে বাকিগুলো চেক করবে...</b>\n"
+                            f"📊 যাচাই: <code>{idx - 1}/{len(link_items)}</code> | ✅ {HUNT_MIN_VIDEOS}+ ভিডিও: <code>{len(matches)}</code> টি",
                             buttons=[[Button.inline("🛑 থামান ও রিপোর্ট দেখুন", f"hs:{prof_key}".encode())]],
                         )
                         for _ in range((fl.seconds + 2) // 2 + 1):
@@ -2655,8 +2767,10 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
 
                 checked_count += 1
                 if status_note == "too_many_channels":
-                    stop_reason = "অ্যাকাউন্টের সর্বোচ্চ চ্যানেল জয়েন লিমিট পূর্ণ হওয়ায় থেমেছে"
-                    break
+                    private_join_blocked = True
+                    partial_note = "চ্যানেল জয়েন লিমিট পূর্ণ হওয়ায় নতুন প্রাইভেট লিংক জয়েন বাদ পড়েছে"
+                    skipped_err += 1
+                    continue
                 if not ent:
                     skipped_err += 1
                     continue
@@ -2672,13 +2786,24 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 try:
                     vid_total = await count_real_videos_in_chat(uc, ent)
                 except FloodWaitError as fl:
-                    if fl.seconds > 90:
+                    if fl.seconds > 120:
                         stop_reason = f"টেলিগ্রাম লিমিটের ({fl.seconds}s) কারণে বিরতি"
                         break
-                    await asyncio.sleep(min(fl.seconds + 2, 92))
-                    vid_total = await count_real_videos_in_chat(uc, ent)
+                    await bot_client.edit_message(
+                        reply_chat_id,
+                        status_msg_id,
+                        f"⏳ <b>ভিডিও গণনায় {fl.seconds} সেকেন্ড বিরতি (অটো চলবে)...</b>\n"
+                        f"📊 যাচাই: <code>{idx}/{len(link_items)}</code> | ✅ {HUNT_MIN_VIDEOS}+ ভিডিও: <code>{len(matches)}</code> টি",
+                        buttons=[[Button.inline("🛑 থামান ও রিপোর্ট দেখুন", f"hs:{prof_key}".encode())]],
+                    )
+                    for _ in range((fl.seconds + 2) // 2 + 1):
+                        if hunt_state["should_stop"]:
+                            break
+                        await asyncio.sleep(2.0)
+                    if not hunt_state["should_stop"]:
+                        vid_total = await count_real_videos_in_chat(uc, ent)
 
-                if vid_total > HUNT_MIN_VIDEOS:
+                if vid_total >= HUNT_MIN_VIDEOS:
                     ctitle = getattr(ent, "title", None) or getattr(ent, "username", None) or disp_url
                     matches.append({"title": ctitle, "videos": vid_total, "link": disp_url, "id": pid})
                 else:
@@ -2687,11 +2812,11 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 break
             finally:
                 # Auto-leave temporary freshly joined junk/duplicate chats so account doesn't hit 500-channel cap
-                if freshly_joined and ent and (is_dup_chat or vid_total <= HUNT_MIN_VIDEOS):
+                if freshly_joined and ent and (is_dup_chat or vid_total < HUNT_MIN_VIDEOS):
                     await leave_chat_silently(uc, ent)
 
-            # Polite pacing to minimize Invite/Resolve FloodWaits
-            await asyncio.sleep(1.5 if freshly_joined else 0.45)
+            # Polite pacing to reduce ResolveUsername / ImportChatInvite flood-waits
+            await asyncio.sleep(2.2 if freshly_joined else (1.1 if ck.startswith("user:") else 0.35))
 
             now_m = time.monotonic()
             if now_m - last_edit >= 3.0 or idx == len(link_items):
@@ -2711,9 +2836,14 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
                 except Exception:
                     pass
 
+        final_note = stop_reason or partial_note
+        logger.info(
+            f"✅ [LinkHunter:{prof_key}] Finished {start_title!r}: checked={checked_count}/{len(link_items)}, "
+            f"matches={len(matches)}, under={skipped_under}, err={skipped_err}, note={final_note!r}"
+        )
         await send_link_hunt_report(
             reply_chat_id, status_msg_id, prof_key, start_title,
-            len(link_items), checked_count, matches, skipped_under, skipped_err, stop_reason
+            len(link_items), checked_count, matches, skipped_under, skipped_err, final_note
         )
     except asyncio.CancelledError:
         hunt_state["should_stop"] = True
@@ -2803,9 +2933,9 @@ async def prompt_link_hunt(send_or_edit_fn, sender_id: int, prof_key: str, page:
     ])
 
     await send_or_edit_fn(
-        "🔍 <b>লিংক খুজা (১০০+ ভিডিও ফাইন্ডার)</b>\n\n"
+        f"🔍 <b>লিংক খুজা ({HUNT_MIN_VIDEOS}+ ভিডিও ফাইন্ডার)</b>\n\n"
         "যেকোনো একটি গ্রুপ বা চ্যানেলের লিংক এখানে পাঠান (যেমন: <code>https://t.me/+...</code> বা <code>https://t.me/channel</code> বা <code>@username</code>)\n\n"
-        "💡 <i>বট ওই গ্রুপের ভেতরের সব লিংক একটি একটি করে চেক করে, যেসব গ্রুপ/চ্যানেলে <b>১০০-টির বেশি ভিডিও</b> আছে সবগুলোর লিংকসহ একসাথে রিপোর্ট দিবে!</i>\n\n"
+        f"💡 <i>বট ওই গ্রুপের ভেতরের সব লিংক একটি একটি করে চেক করে, যেসব গ্রুপ/চ্যানেলে <b>{HUNT_MIN_VIDEOS}টি বা তার বেশি ভিডিও</b> আছে সবগুলোর লিংকসহ একসাথে রিপোর্ট দিবে!</i>\n\n"
         f"📊 <b>আপনার জয়েন করা মোট গ্রুপ/চ্যানেল:</b> <code>{len(all_items)}</code> টি | 🕒 <code>{scan_time}</code>\n"
         "নিচ থেকে আপনার নিজের বা জয়েন থাকা যেকোনো গ্রুপে চাপুন (পরবর্তী পেজ দেখতে ➡️ চাপুন):",
         buttons=btns,
