@@ -1419,10 +1419,16 @@ async def run_client_forever(client: TelegramClient, label: str):
             break
         except (tl_errors.AuthKeyDuplicatedError, tl_errors.AuthKeyUnregisteredError) as fatal_auth:
             logger.error(f"❌ {label} session invalidated ({type(fatal_auth).__name__}). Reconnect via /login QR.")
+            for k, v in list(user_clients.items()):
+                if v is client:
+                    user_clients.pop(k, None)
             break
         except Exception as e:
             if "authkeyduplicated" in str(e).lower():
                 logger.error(f"❌ {label} session duplicated/invalidated. Reconnect via /login QR.")
+                for k, v in list(user_clients.items()):
+                    if v is client:
+                        user_clients.pop(k, None)
                 break
             logger.error(f"⚠️ {label} connection error ({e}). Reconnecting in {backoff}s...")
         await asyncio.sleep(backoff)
@@ -2237,6 +2243,10 @@ def extract_telegram_links_from_message(message) -> list[tuple[str, str]]:
                 if u:
                     texts.append(u)
 
+    wp = getattr(getattr(message, "media", None), "webpage", None)
+    if wp and getattr(wp, "url", None):
+        texts.append(wp.url)
+
     return _extract_links_from_blobs(texts)
 
 def get_active_hunt(prof_key: str) -> dict:
@@ -2548,7 +2558,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
         except Exception:
             pass
 
-        scan_filter = types.InputMessagesFilterUrl if total_msgs > 5000 else None
+        scan_filter = types.InputMessagesFilterUrl if total_msgs > 25000 else None
         scanned_msgs = 0
         last_edit = 0.0
         async for m in resilient_iter_messages(
@@ -2730,12 +2740,20 @@ async def prompt_link_hunt(send_or_edit_fn, sender_id: int, prof_key: str):
     pending_link_hunts[sender_id] = {"prof_key": prof_key, "created_at": time.monotonic()}
 
     btns = []
-    # Quick picks from connected user's cached groups or selected sources
+    # Quick picks from connected user's cached groups or configured sources
     quick_items = dialog_caches.get(acc_id, {}).get("list", [])[:4]
+    if not quick_items and profile.get("source_ids"):
+        s_titles = profile.get("source_titles", {})
+        quick_items = [
+            {"id": sid, "title": s_titles.get(str(sid), str(sid))}
+            for sid in profile.get("source_ids", [])[:4]
+        ]
     for it in quick_items:
         cid = it["id"]
-        title = it["title"][:24]
-        btns.append([Button.inline(f"📂 {title}", f"hp:{prof_key}:{cid}".encode())])
+        cb = f"hp:{prof_key}:{cid}".encode()
+        if len(cb) <= 64:
+            title = str(it.get("title", cid))[:24]
+            btns.append([Button.inline(f"📂 {title}", cb)])
     btns.append([Button.inline("❌ বাতিল করুন", f"hc:{prof_key}".encode())])
 
     await send_or_edit_fn(
@@ -3242,13 +3260,17 @@ async def complete_inbot_login(uid: int, state_data: dict, reply_target):
     profile["active_account_id"] = new_uid
     save_state()
 
-    # Keep client live in user_clients pool!
-    if new_uid not in user_clients:
+    # Replace stale/dead client or keep fresh authenticated client live in user_clients pool
+    old_client = user_clients.get(new_uid)
+    if old_client is not tmp_client:
+        if old_client is not None:
+            try:
+                await old_client.disconnect()
+            except Exception:
+                pass
         user_clients[new_uid] = tmp_client
         attach_userbot_listeners(tmp_client, new_uid)
         asyncio.create_task(run_client_forever(tmp_client, f"User:{new_uid}"))
-    else:
-        await tmp_client.disconnect()
 
     pending_logins.pop(uid, None)
     items, scan_time = await scan_account_dialogs(new_uid, force_refresh=True)
@@ -3582,10 +3604,11 @@ async def bot_callback_handler(event):
     parts = raw_data.split(":")
     cmd = parts[0]
     prof_key = parts[1] if len(parts) > 1 else str(event.chat_id)
+    cb_uid = getattr(event, "sender_id", None) or event.chat_id
     profile = get_profile(prof_key)
 
     if cmd == "home":
-        pending_link_hunts.pop(event.sender_id, None)
+        pending_link_hunts.pop(cb_uid, None)
         await event.answer()
         await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
         return
@@ -3594,17 +3617,17 @@ async def bot_callback_handler(event):
         await event.answer()
         async def _edit_or_send(txt, buttons=None):
             return await safe_edit_message(event, txt, buttons=buttons)
-        await prompt_link_hunt(_edit_or_send, event.sender_id, prof_key)
+        await prompt_link_hunt(_edit_or_send, cb_uid, prof_key)
         return
 
     if cmd == "hc":
-        pending_link_hunts.pop(event.sender_id, None)
+        pending_link_hunts.pop(cb_uid, None)
         await event.answer("❌ বাতিল করা হয়েছে")
         await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
         return
 
     if cmd == "hs":
-        stopped, _ = trigger_hunt_stop(prof_key, event.sender_id)
+        stopped, _ = trigger_hunt_stop(prof_key, cb_uid)
         if stopped:
             await event.answer("🛑 থামানো হচ্ছে ও রিপোর্ট তৈরি হচ্ছে...", alert=False)
         else:
@@ -3612,7 +3635,7 @@ async def bot_callback_handler(event):
         return
 
     if cmd == "hp":
-        pending_link_hunts.pop(event.sender_id, None)
+        pending_link_hunts.pop(cb_uid, None)
         hunt_state = get_active_hunt(prof_key)
         if hunt_state.get("running"):
             await event.answer("⚠️ ইতিমধ্যেই একটি লিংক খোঁজার কাজ চলছে!", alert=True)
@@ -4069,6 +4092,9 @@ async def bot_message_handler(event):
                 else:
                     clean = clean_chat_input(raw_text)
                     entity = await uc.get_entity(clean)
+
+            if entity is None or isinstance(entity, types.User):
+                raise ValueError("এটি কোনো গ্রুপ বা চ্যানেলের লিংক নয়!")
 
             peer_id = normalize_peer_id(entity)
             title = getattr(entity, "title", None) or getattr(entity, "username", str(peer_id))
