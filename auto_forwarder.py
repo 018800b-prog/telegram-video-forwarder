@@ -2169,6 +2169,8 @@ _TME_LINK_RE = re.compile(
     r"(\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+|c/\d+(?:/\d+)?|[A-Za-z][A-Za-z0-9_]{3,31}(?:/\d+)?)",
     re.IGNORECASE,
 )
+_TG_DEEP_INV_RE = re.compile(r"tg://join\?invite=([A-Za-z0-9_-]+)", re.IGNORECASE)
+_TG_DEEP_USER_RE = re.compile(r"tg://resolve\?domain=([A-Za-z][A-Za-z0-9_]{3,31})", re.IGNORECASE)
 _AT_USER_RE = re.compile(r"(?<![A-Za-z0-9_.])@([A-Za-z][A-Za-z0-9_]{3,31})")
 
 def _normalize_telegram_candidate(raw_token: str, is_at_username: bool = False) -> tuple[str, str] | None:
@@ -2213,6 +2215,14 @@ def _extract_links_from_blobs(texts: list[str]) -> list[tuple[str, str]]:
     for blob in texts:
         for m in _TME_LINK_RE.finditer(blob):
             norm = _normalize_telegram_candidate(m.group(1), is_at_username=False)
+            if norm and norm[0] not in seen:
+                seen[norm[0]] = norm[1]
+        for m in _TG_DEEP_INV_RE.finditer(blob):
+            norm = _normalize_telegram_candidate("+" + m.group(1), is_at_username=False)
+            if norm and norm[0] not in seen:
+                seen[norm[0]] = norm[1]
+        for m in _TG_DEEP_USER_RE.finditer(blob):
+            norm = _normalize_telegram_candidate(m.group(1), is_at_username=True)
             if norm and norm[0] not in seen:
                 seen[norm[0]] = norm[1]
         for m in _AT_USER_RE.finditer(blob):
@@ -2283,7 +2293,9 @@ async def leave_chat_silently(uc: TelegramClient, ent):
     except Exception:
         pass
 
-async def resolve_chat_link_for_hunt(uc: TelegramClient, raw_or_key: str, allow_join: bool = True) -> tuple[object | None, bool, str]:
+async def resolve_chat_link_for_hunt(
+    uc: TelegramClient, raw_or_key: str, allow_join: bool = True, acc_id: int | None = None
+) -> tuple[object | None, bool, str]:
     """
     Resolves a Telegram link, @username, peer ID, or normalized key ('inv:', 'cid:', 'user:').
     Returns (entity, freshly_joined, status_note). Re-raises FloodWaitError for caller backoff.
@@ -2327,10 +2339,14 @@ async def resolve_chat_link_for_hunt(uc: TelegramClient, raw_or_key: str, allow_
                     freshly_joined = True
         elif canon_key.startswith("cid:"):
             peer_id = int(f"-100{canon_key.split(':', 1)[1]}")
-            ent = await uc.get_entity(peer_id)
+            ent = await get_entity_safe(uc, peer_id, f"u_{acc_id}" if acc_id else "default")
+            if ent is None:
+                ent = await uc.get_entity(peer_id)
         elif canon_key.startswith("peer:"):
             peer_id = int(canon_key.split(":", 1)[1])
-            ent = await uc.get_entity(peer_id)
+            ent = await get_entity_safe(uc, peer_id, f"u_{acc_id}" if acc_id else "default")
+            if ent is None:
+                ent = await uc.get_entity(peer_id)
         elif canon_key.startswith("user:"):
             uname = canon_key.split(":", 1)[1]
             ent = await uc.get_entity(uname)
@@ -2512,7 +2528,7 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
     try:
         # Step 1: Resolve starting group
         try:
-            start_ent, start_joined, note = await resolve_chat_link_for_hunt(uc, target_input, allow_join=True)
+            start_ent, start_joined, note = await resolve_chat_link_for_hunt(uc, target_input, allow_join=True, acc_id=acc_id)
         except FloodWaitError as fl:
             await bot_client.edit_message(
                 reply_chat_id,
@@ -2715,9 +2731,18 @@ async def run_link_hunter(prof_key: str, acc_id: int | None, target_input: str, 
         hunt_state["running"] = False
         hunt_state["task"] = None
 
-async def prompt_link_hunt(send_or_edit_fn, sender_id: int, prof_key: str):
+async def prompt_link_hunt(send_or_edit_fn, sender_id: int, prof_key: str, page: int = 0, force_refresh: bool = False):
     profile = get_profile(prof_key)
     acc_id = profile.get("active_account_id")
+    if (not acc_id or acc_id not in user_clients) and user_clients:
+        if sender_id in user_clients:
+            acc_id = sender_id
+        elif sender_id == DEFAULT_OWNER_ID and len(user_clients) == 1:
+            acc_id = next(iter(user_clients))
+        if acc_id and acc_id in user_clients:
+            profile["active_account_id"] = acc_id
+            save_state()
+
     if not acc_id or acc_id not in user_clients:
         await send_or_edit_fn(
             "⚠️ গ্রুপের ভেতরের সব লিংক খুঁজতে আপনার টেলিগ্রাম অ্যাকাউন্ট কানেক্ট থাকতে হবে। নিচের বাটনে চাপুন:",
@@ -2739,28 +2764,50 @@ async def prompt_link_hunt(send_or_edit_fn, sender_id: int, prof_key: str):
     pending_logins.pop(sender_id, None)
     pending_link_hunts[sender_id] = {"prof_key": prof_key, "created_at": time.monotonic()}
 
-    btns = []
-    # Quick picks from connected user's cached groups or configured sources
-    quick_items = dialog_caches.get(acc_id, {}).get("list", [])[:4]
-    if not quick_items and profile.get("source_ids"):
+    # Load ALL joined groups & channels (main + archived) so user can pick ANY joined group, not just own/top 4
+    all_items, scan_time = await scan_account_dialogs(acc_id, force_refresh=force_refresh)
+    if not all_items and profile.get("source_ids"):
         s_titles = profile.get("source_titles", {})
-        quick_items = [
-            {"id": sid, "title": s_titles.get(str(sid), str(sid))}
-            for sid in profile.get("source_ids", [])[:4]
+        all_items = [
+            {"id": sid, "title": s_titles.get(str(sid), str(sid)), "type": "group", "source": "saved"}
+            for sid in profile.get("source_ids", [])
         ]
-    for it in quick_items:
+
+    per_page = 10
+    total_pages = max(1, (len(all_items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    current_slice = all_items[page * per_page : (page + 1) * per_page]
+
+    btns = []
+    for it in current_slice:
         cid = it["id"]
         cb = f"hp:{prof_key}:{cid}".encode()
         if len(cb) <= 64:
-            title = str(it.get("title", cid))[:24]
-            btns.append([Button.inline(f"📂 {title}", cb)])
-    btns.append([Button.inline("❌ বাতিল করুন", f"hc:{prof_key}".encode())])
+            icon = "📢" if it.get("type") == "channel" else "👥"
+            title = str(it.get("title", cid))[:26]
+            btns.append([Button.inline(f"{icon} {title}", cb)])
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("⬅️ পূর্ববর্তী", f"hl:{prof_key}:{page - 1}".encode()))
+        nav.append(Button.inline(f"📄 {page + 1}/{total_pages}", b"noop"))
+        if page < total_pages - 1:
+            nav.append(Button.inline("পরবর্তী ➡️", f"hl:{prof_key}:{page + 1}".encode()))
+        if nav:
+            btns.append(nav)
+
+    btns.append([
+        Button.inline("🔄 সব জয়েন করা গ্রুপ রিফ্রেশ", f"h_scan:{prof_key}".encode()),
+        Button.inline("❌ বাতিল করুন", f"hc:{prof_key}".encode()),
+    ])
 
     await send_or_edit_fn(
         "🔍 <b>লিংক খুজা (১০০+ ভিডিও ফাইন্ডার)</b>\n\n"
         "যেকোনো একটি গ্রুপ বা চ্যানেলের লিংক এখানে পাঠান (যেমন: <code>https://t.me/+...</code> বা <code>https://t.me/channel</code> বা <code>@username</code>)\n\n"
         "💡 <i>বট ওই গ্রুপের ভেতরের সব লিংক একটি একটি করে চেক করে, যেসব গ্রুপ/চ্যানেলে <b>১০০-টির বেশি ভিডিও</b> আছে সবগুলোর লিংকসহ একসাথে রিপোর্ট দিবে!</i>\n\n"
-        "অথবা নিচ থেকে আপনার যেকোনো গ্রুপে চাপুন:",
+        f"📊 <b>আপনার জয়েন করা মোট গ্রুপ/চ্যানেল:</b> <code>{len(all_items)}</code> টি | 🕒 <code>{scan_time}</code>\n"
+        "নিচ থেকে আপনার নিজের বা জয়েন থাকা যেকোনো গ্রুপে চাপুন (পরবর্তী পেজ দেখতে ➡️ চাপুন):",
         buttons=btns,
     )
 
@@ -3613,11 +3660,19 @@ async def bot_callback_handler(event):
         await safe_edit_message(event, get_main_menu_text(prof_key), buttons=get_main_menu_buttons(prof_key, is_private=event.is_private))
         return
 
-    if cmd == "hunt":
-        await event.answer()
+    if cmd in ("hunt", "hl", "h_scan"):
+        force_ref = (cmd == "h_scan")
+        pg = int(parts[2]) if (cmd == "hl" and len(parts) > 2 and parts[2].isdigit()) else 0
+        acc_id = profile.get("active_account_id")
+        if force_ref:
+            await event.answer("🔄 আপনার জয়েন করা সব গ্রুপ ও চ্যানেল রিফ্রেশ হচ্ছে...", alert=False)
+        elif not acc_id or not dialog_caches.get(acc_id, {}).get("list"):
+            await event.answer("🔍 সব গ্রুপ ও চ্যানেল তালিকা লোড হচ্ছে...", alert=False)
+        else:
+            await event.answer()
         async def _edit_or_send(txt, buttons=None):
             return await safe_edit_message(event, txt, buttons=buttons)
-        await prompt_link_hunt(_edit_or_send, cb_uid, prof_key)
+        await prompt_link_hunt(_edit_or_send, cb_uid, prof_key, page=pg, force_refresh=force_ref)
         return
 
     if cmd == "hc":
